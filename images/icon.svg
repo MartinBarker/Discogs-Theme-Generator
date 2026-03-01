@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- Palette body -->
+  <path d="M64 6
+    C29 6 6 29 6 58
+    C6 72 12 84 22 92
+    C32 100 46 106 60 106
+    C70 106 78 102 82 94
+    C84 89 82 82 78 78
+    C75 75 75 70 78 68
+    C81 66 86 67 89 70
+    C94 75 102 74 108 68
+    C122 54 122 18 90 10
+    C82 7 73 6 64 6Z"
+    fill="#2d2d3f" stroke="#4a4a6a" stroke-width="2"/>
+
+  <!-- Paint blobs on palette -->
+  <circle cx="38" cy="54" r="10" fill="#e17055"/>
+  <circle cx="55" cy="78" r="10" fill="#fdcb6e"/>
+  <circle cx="76" cy="82" r="10" fill="#00b894"/>
+  <circle cx="88" cy="50" r="10" fill="#74b9ff"/>
+  <circle cx="46" cy="38" r="10" fill="#fd79a8"/>
+  <circle cx="72" cy="28" r="9" fill="#a29bfe"/>
+
+  <!-- Thumb hole -->
+  <ellipse cx="28" cy="78" rx="12" ry="14" fill="#1a1a2e"/>
+
+  <!-- Paintbrush handle -->
+  <rect x="88" y="72" width="8" height="40" rx="4" fill="#c8a86b" transform="rotate(-35 88 72)"/>
+  <!-- Brush bristles -->
+  <ellipse cx="107" cy="112" rx="5" ry="9" fill="#e8d5b0" transform="rotate(-35 107 112)"/>
+  <ellipse cx="103" cy="108" rx="3" ry="7" fill="#f8e9cc" transform="rotate(-35 103 108)"/>
+</svg>

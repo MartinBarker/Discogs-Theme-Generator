@@ -1,0 +1,49 @@
+{
+  "name": "discogs-color-theme",
+  "displayName": "Discogs Color Theme",
+  "description": "Randomly generate and apply beautiful color themes to your VS Code or Cursor window instantly.",
+  "version": "0.0.7",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/discogs-color-theme.git"
+  },
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Themes",
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "discogsColorTheme.open",
+        "title": "Open Discogs Color Theme",
+        "category": "Discogs Color Theme",
+        "icon": "images/icon.png"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run bundle",
+    "bundle": "node -e \"const fs=require('fs');['colorTheme','discogsApi','history','panel'].forEach(f=>{try{fs.unlinkSync('out/'+f+'.js');fs.unlinkSync('out/'+f+'.js.map');}catch{}});\" && esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node20 --minify",
+    "compile": "tsc -p ./ --noEmit",
+    "watch": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --platform=node --target=node20 --watch",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "esbuild": "^0.27.3",
+    "eslint": "^8.57.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "node-vibrant": "^4.0.4"
+  }
+}

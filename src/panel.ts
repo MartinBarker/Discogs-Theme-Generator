@@ -1,0 +1,988 @@
+import * as vscode from 'vscode';
+import { generateColorTheme, buildThemeFromVibrantPalette, ColorTokens, GeneratedTheme } from './colorTheme';
+import { fetchRandomRelease, fetchImageBuffer, fetchImageDataUri, extractVibrantPalette, DiscogsRelease } from './discogsApi';
+import {
+  getHistory, pushHistory, deleteEntry, clearHistory,
+  toSummary, discogsFromRelease, HistoryEntry,
+} from './history';
+
+const PREV_KEY  = 'discogsColorTheme.prev';   // { scope, tokens }
+const SCOPE_KEY = 'discogsColorTheme.workspaceScope'; // true = workspace
+const AR_KEY    = 'discogsColorTheme.autoRefresh';    // AutoRefreshConfig
+
+interface AutoRefreshConfig {
+  mode: 'off' | 'onOpen' | 'interval';
+  intervalHours: number;
+}
+
+export class DiscogsColorThemePanel {
+  private panel: vscode.WebviewPanel | undefined;
+  private readonly ctx: vscode.ExtensionContext;
+  private autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(ctx: vscode.ExtensionContext) {
+    this.ctx = ctx;
+    ctx.subscriptions.push({ dispose: () => this.clearTimer() });
+  }
+
+  openOrReveal() {
+    if (this.panel) { this.panel.reveal(vscode.ViewColumn.One); return; }
+    this.panel = vscode.window.createWebviewPanel(
+      'discogsColorTheme', 'Discogs Color Theme', vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    this.panel.webview.html = this.buildHtml();
+    this.panel.webview.onDidReceiveMessage((m) => this.handleMessage(m));
+    this.panel.onDidDispose(() => { this.panel = undefined; });
+    setTimeout(() => {
+      this.sendHistory();
+      this.post({ command: 'stateSync', scope: this.getScopeLabel(), autoRefresh: this.getAutoRefreshConfig() });
+    }, 300);
+  }
+
+  // ─── Called by extension.ts on activate ──────────────────────────────────────
+
+  public startAutoRefresh() {
+    const cfg = this.getAutoRefreshConfig();
+    if (cfg.mode === 'onOpen') {
+      this.applyDiscogsThemeSilently();
+    } else if (cfg.mode === 'interval') {
+      this.startAutoRefreshTimer();
+    }
+  }
+
+  // ─── Message router ──────────────────────────────────────────────────────────
+
+  private async handleMessage(msg: any) {
+    switch (msg.command) {
+      case 'generate':       await this.applyRandom(); break;
+      case 'fromDiscogs':    await this.startDiscogsFlow(); break;
+      case 'loadEntry':      await this.loadHistoryEntry(msg.id); break;
+      case 'deleteEntry':    await this.deleteHistoryEntry(msg.id); break;
+      case 'copyJson':       await this.copyJson(msg.id ?? null, msg.tokens ?? null, msg.name ?? ''); break;
+      case 'clearHistory':   await this.doClearHistory(); break;
+      case 'reset':          await this.resetTheme(); break;
+      case 'openUrl':        vscode.env.openExternal(vscode.Uri.parse(msg.url)); break;
+      case 'setScope':       this.setScope(msg.useWorkspace); break;
+      case 'setAutoRefresh': this.setAutoRefresh(msg.config); break;
+    }
+  }
+
+  // ─── Scope helpers ───────────────────────────────────────────────────────────
+
+  private useWorkspaceScope(): boolean {
+    return this.ctx.globalState.get<boolean>(SCOPE_KEY, true);
+  }
+
+  private getScopeLabel(): 'workspace' | 'global' {
+    return this.useWorkspaceScope() ? 'workspace' : 'global';
+  }
+
+  private getConfigTarget(): vscode.ConfigurationTarget {
+    if (this.useWorkspaceScope() && vscode.workspace.workspaceFolders?.length) {
+      return vscode.ConfigurationTarget.Workspace;
+    }
+    return vscode.ConfigurationTarget.Global;
+  }
+
+  private setScope(useWorkspace: boolean) {
+    this.ctx.globalState.update(SCOPE_KEY, useWorkspace);
+  }
+
+  // ─── Auto-refresh helpers ─────────────────────────────────────────────────────
+
+  private getAutoRefreshConfig(): AutoRefreshConfig {
+    return this.ctx.globalState.get<AutoRefreshConfig>(AR_KEY, { mode: 'off', intervalHours: 2 });
+  }
+
+  private setAutoRefresh(config: AutoRefreshConfig) {
+    this.ctx.globalState.update(AR_KEY, config);
+    this.clearTimer();
+    if (config.mode === 'interval') { this.startAutoRefreshTimer(); }
+  }
+
+  private startAutoRefreshTimer() {
+    this.clearTimer();
+    const cfg = this.getAutoRefreshConfig();
+    if (cfg.mode !== 'interval') { return; }
+    const ms = Math.max(cfg.intervalHours, 1) * 60 * 60 * 1000;
+    const tick = async () => {
+      await this.applyDiscogsThemeSilently();
+      this.autoRefreshTimer = setTimeout(tick, ms);
+    };
+    this.autoRefreshTimer = setTimeout(tick, ms);
+  }
+
+  private clearTimer() {
+    if (this.autoRefreshTimer) { clearTimeout(this.autoRefreshTimer); this.autoRefreshTimer = undefined; }
+  }
+
+  // ─── Random theme ─────────────────────────────────────────────────────────────
+
+  private async applyRandom() {
+    const theme = generateColorTheme();
+    await this.applyTheme(theme, 'random');
+  }
+
+  // ─── Discogs flow ─────────────────────────────────────────────────────────────
+
+  private async startDiscogsFlow() {
+    this.post({ command: 'statusUpdate', message: 'Finding a release on Discogs…' });
+    try {
+      const release = await fetchRandomRelease();
+
+      this.post({ command: 'statusUpdate', message: 'Fetching album art…' });
+      const { buffer, contentType } = await fetchImageBuffer(release.imageUrl);
+      const imageDataUri = `data:${contentType};base64,${buffer.toString('base64')}`;
+
+      let thumbDataUri = imageDataUri;
+      if (release.thumb && release.thumb !== release.imageUrl) {
+        try { thumbDataUri = await fetchImageDataUri(release.thumb); }
+        catch { /* fall back to full image data URI */ }
+      }
+
+      // Show album art card immediately
+      this.post({ command: 'discogsImageReady', release, imageDataUri, thumbDataUri });
+
+      this.post({ command: 'statusUpdate', message: 'Extracting colours with Vibrant…' });
+      const palette = await extractVibrantPalette(buffer);
+
+      // Send debug info: exact URL passed to Vibrant + all extracted swatch hex values
+      this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
+
+      this.post({ command: 'statusUpdate', message: 'Applying palette…' });
+      const theme = buildThemeFromVibrantPalette(palette);
+      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+    } catch (e: any) {
+      this.post({ command: 'discogsError', message: e.message });
+      vscode.window.showErrorMessage(`Discogs fetch failed: ${e.message}`);
+    }
+  }
+
+  /** Silent Discogs refresh — used by auto-refresh (no panel required). */
+  private async applyDiscogsThemeSilently() {
+    try {
+      const release = await fetchRandomRelease();
+      const { buffer, contentType } = await fetchImageBuffer(release.imageUrl);
+      const imageDataUri = `data:${contentType};base64,${buffer.toString('base64')}`;
+
+      let thumbDataUri = imageDataUri;
+      if (release.thumb && release.thumb !== release.imageUrl) {
+        try { thumbDataUri = await fetchImageDataUri(release.thumb); }
+        catch { /* fall back */ }
+      }
+
+      const palette = await extractVibrantPalette(buffer);
+      const theme = buildThemeFromVibrantPalette(palette);
+      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+
+      // Update the open panel's card if visible
+      if (this.panel) {
+        this.post({ command: 'discogsImageReady', release, imageDataUri, thumbDataUri });
+        this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
+      }
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`Auto-refresh (Discogs) failed: ${e.message}`);
+    }
+  }
+
+  // ─── Apply / reset ────────────────────────────────────────────────────────────
+
+  private async applyTheme(
+    theme: GeneratedTheme,
+    source: 'random' | 'discogs',
+    release?: DiscogsRelease & { thumbDataUri?: string },
+  ) {
+    const target = this.getConfigTarget();
+    const scopeLabel = this.getScopeLabel();
+    const config = vscode.workspace.getConfiguration('workbench');
+
+    if (!this.ctx.globalState.get(PREV_KEY)) {
+      const prevTokens = config.get<ColorTokens>('colorCustomizations') ?? {};
+      await this.ctx.globalState.update(PREV_KEY, { scope: scopeLabel, tokens: prevTokens });
+    }
+
+    await config.update('colorCustomizations', theme.tokens, target);
+
+    const entry: HistoryEntry = {
+      id:        `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name:      theme.name,
+      isDark:    theme.isDark,
+      swatches:  theme.swatches,
+      tokens:    theme.tokens,
+      timestamp: Date.now(),
+      source,
+      discogs:   release ? discogsFromRelease(release) : undefined,
+    };
+    await pushHistory(this.ctx, entry);
+
+    this.post({
+      command: 'themeApplied',
+      entry: { ...toSummary(entry), tokens: theme.tokens },
+    });
+    this.sendHistory();
+  }
+
+  private async loadHistoryEntry(id: string) {
+    const entry = getHistory(this.ctx).find((e) => e.id === id);
+    if (!entry) { return; }
+    const target = this.getConfigTarget();
+    const config = vscode.workspace.getConfiguration('workbench');
+    if (!this.ctx.globalState.get(PREV_KEY)) {
+      const prevTokens = config.get<ColorTokens>('colorCustomizations') ?? {};
+      await this.ctx.globalState.update(PREV_KEY, { scope: this.getScopeLabel(), tokens: prevTokens });
+    }
+    await config.update('colorCustomizations', entry.tokens, target);
+    this.post({
+      command: 'themeApplied',
+      entry: { ...toSummary(entry), tokens: entry.tokens },
+    });
+  }
+
+  private async resetTheme() {
+    const saved = this.ctx.globalState.get<{ scope?: string; tokens: ColorTokens } | ColorTokens>(PREV_KEY);
+    if (saved === undefined) {
+      vscode.window.showInformationMessage('No theme to reset — generate one first.');
+      return;
+    }
+    // Handle both new format { scope, tokens } and legacy format (just tokens)
+    let scope: string;
+    let tokens: ColorTokens;
+    if ('scope' in (saved as object) && 'tokens' in (saved as object)) {
+      const s = saved as { scope: string; tokens: ColorTokens };
+      scope = s.scope; tokens = s.tokens;
+    } else {
+      scope = 'global'; tokens = saved as ColorTokens;
+    }
+    const target = scope === 'workspace' && vscode.workspace.workspaceFolders?.length
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+    const config = vscode.workspace.getConfiguration('workbench');
+    await config.update(
+      'colorCustomizations',
+      Object.keys(tokens).length > 0 ? tokens : undefined,
+      target,
+    );
+    await this.ctx.globalState.update(PREV_KEY, undefined);
+    this.post({ command: 'themeReset' });
+  }
+
+  // ─── History ops ─────────────────────────────────────────────────────────────
+
+  private async deleteHistoryEntry(id: string) {
+    await deleteEntry(this.ctx, id);
+    this.sendHistory();
+  }
+
+  private async doClearHistory() {
+    await clearHistory(this.ctx);
+    this.sendHistory();
+  }
+
+  private sendHistory() {
+    this.post({ command: 'historyUpdated', history: getHistory(this.ctx).map(toSummary) });
+  }
+
+  // ─── JSON ─────────────────────────────────────────────────────────────────────
+
+  private async copyJson(historyId: string | null, inlineTokens: ColorTokens | null, name: string) {
+    let tokens = inlineTokens ?? undefined;
+    let themeName = name;
+    if (historyId) {
+      const e = getHistory(this.ctx).find((x) => x.id === historyId);
+      if (e) { tokens = e.tokens; themeName = e.name; }
+    }
+    if (!tokens) { return; }
+    const json = JSON.stringify({
+      name: themeName,
+      generator: 'Discogs Color Theme',
+      'workbench.colorCustomizations': tokens,
+    }, null, 2);
+    await vscode.env.clipboard.writeText(json);
+    this.post({ command: 'copySuccess', id: historyId });
+    vscode.window.showInformationMessage(`"${themeName}" copied to clipboard.`);
+  }
+
+  // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+  private post(msg: object) { this.panel?.webview.postMessage(msg); }
+
+  // ─── HTML ─────────────────────────────────────────────────────────────────────
+
+  private buildHtml(): string {
+    const nonce = Array.from({ length: 32 }, () =>
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 62)]
+    ).join('');
+
+    return /* html */`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy"
+  content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; frame-src https://www.youtube-nocookie.com;">
+<title>Discogs Color Theme</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background);
+  padding: 20px 18px 56px;
+  min-height: 100vh;
+}
+/* ── header ── */
+.hdr { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
+h1 { font-size:1.35em; font-weight:700; }
+.sub { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:16px; padding-left:42px; }
+/* ── scope toggle ── */
+.scope-row { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.scope-lbl { font-size:.72em; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--vscode-descriptionForeground); white-space:nowrap; }
+.seg { display:flex; border-radius:6px; overflow:hidden; border:1px solid var(--vscode-widget-border,rgba(255,255,255,.15)); }
+.seg-btn {
+  flex:1; border:none; background:transparent; color:var(--vscode-descriptionForeground);
+  font:inherit; font-size:.78em; padding:5px 12px; cursor:pointer;
+  display:flex; align-items:center; gap:5px; transition:background .12s,color .12s;
+}
+.seg-btn + .seg-btn { border-left:1px solid var(--vscode-widget-border,rgba(255,255,255,.15)); }
+.seg-btn.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); }
+.seg-btn:hover:not(.active) { background:var(--vscode-list-hoverBackground,rgba(255,255,255,.06)); }
+/* ── buttons ── */
+.actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+button {
+  display:inline-flex; align-items:center; gap:6px;
+  border:none; border-radius:5px; cursor:pointer;
+  font:inherit; font-size:.84em; font-weight:500;
+  padding:7px 13px; transition:filter .12s, opacity .12s;
+}
+button:hover:not(:disabled) { filter:brightness(1.15); }
+button:active:not(:disabled) { filter:brightness(.88); }
+button:disabled { opacity:.35; cursor:not-allowed; }
+.bp  { background:var(--vscode-button-background); color:var(--vscode-button-foreground); }
+.bs  {
+  background:var(--vscode-button-secondaryBackground, rgba(255,255,255,.08));
+  color:var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  border:1px solid var(--vscode-widget-border, rgba(255,255,255,.12));
+}
+.bsm { padding:4px 10px; font-size:.78em; background:var(--vscode-button-secondaryBackground, rgba(255,255,255,.08)); color:var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border:1px solid var(--vscode-widget-border, rgba(255,255,255,.12)); }
+.bdanger { padding:4px 9px; font-size:.76em; background:transparent; color:var(--vscode-errorForeground,#f38ba8); border:1px solid currentColor; }
+.blink { background:none; border:none; padding:0; color:var(--vscode-textLink-foreground,#74b9ff); font-size:.84em; text-decoration:underline; cursor:pointer; }
+.blink:hover { filter:brightness(1.2); }
+.bicon { padding:4px 8px; font-size:.8em; background:var(--vscode-button-secondaryBackground, rgba(255,255,255,.08)); color:var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border:1px solid var(--vscode-widget-border, rgba(255,255,255,.12)); border-radius:4px; }
+/* ── Discogs main button (bigger) ── */
+.bdiscogs {
+  background:var(--vscode-button-background); color:var(--vscode-button-foreground);
+  font-size:.95em; font-weight:600; padding:10px 20px; border-radius:6px; gap:8px;
+}
+/* ── status bar ── */
+.sbar {
+  display:flex; align-items:center; gap:8px;
+  background:var(--vscode-editor-inactiveSelectionBackground, rgba(255,255,255,.05));
+  border:1px solid var(--vscode-widget-border, rgba(255,255,255,.1));
+  border-radius:5px; padding:8px 12px; margin-bottom:16px;
+  font-size:.8em; color:var(--vscode-descriptionForeground);
+}
+.sbar.hidden { display:none; }
+.sbar.err { border-color:var(--vscode-errorForeground,#f38ba8); color:var(--vscode-errorForeground,#f38ba8); }
+.sbar.err .spin { display:none; }
+.spin { width:13px; height:13px; border-radius:50%; flex-shrink:0; border:2px solid rgba(255,255,255,.15); border-top-color:var(--vscode-button-background); animation:spin .7s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+/* ── sections ── */
+.sec { margin-bottom:20px; }
+.sec-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.lbl { font-size:.68em; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--vscode-descriptionForeground); }
+/* ── card ── */
+.card { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:15px; }
+/* ── swatches ── */
+.swatches { display:flex; gap:6px; margin-bottom:11px; }
+.sw { width:28px; height:28px; border-radius:50%; border:2px solid rgba(255,255,255,.14); transition:transform .18s; }
+.sw:hover { transform:scale(1.18); }
+.swatches.empty .sw { background:var(--vscode-widget-border,rgba(255,255,255,.1)); }
+/* ── theme name ── */
+.tname { font-size:1.08em; font-weight:600; margin-bottom:3px; }
+.tmeta { font-size:.76em; color:var(--vscode-descriptionForeground); margin-bottom:11px; }
+.badge { display:inline-block; font-size:.67em; font-weight:600; padding:2px 6px; border-radius:999px; vertical-align:middle; margin-left:5px; position:relative; top:-1px; }
+.bd { background:#2d2d40; color:#a29bfe; }
+.bl { background:#eeeeff; color:#6c5ce7; }
+.bdisc { background:rgba(255,255,255,.1); color:var(--vscode-foreground); }
+.erow { display:flex; flex-wrap:wrap; gap:6px; }
+.erow.hidden { display:none; }
+/* ── discogs card ── */
+.dcrd { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:13px; }
+.dcrd.hidden { display:none; }
+.dcrd-top { display:flex; gap:14px; align-items:flex-start; margin-bottom:12px; }
+.dart { width:120px; height:120px; object-fit:cover; border-radius:5px; flex-shrink:0; background:var(--vscode-widget-border,rgba(255,255,255,.08)); }
+.dinf { flex:1; min-width:0; }
+.dart-nm { font-size:.8em; color:var(--vscode-descriptionForeground); margin-bottom:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dtitle { font-size:1em; font-weight:700; margin-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dyear  { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:4px; }
+.dmeta2 { font-size:.75em; color:var(--vscode-descriptionForeground); margin-bottom:5px; display:flex; flex-wrap:wrap; gap:4px 10px; }
+.dmeta2 span { white-space:nowrap; }
+.dtags  { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:7px; }
+.tag    { font-size:.68em; padding:2px 6px; border-radius:999px; background:rgba(255,255,255,.08); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); }
+.dtracks { font-size:.73em; color:var(--vscode-descriptionForeground); margin-bottom:7px; line-height:1.6; }
+/* ── album art lightbox ── */
+.dart { cursor:zoom-in; }
+.lightbox {
+  position:fixed; inset:0; z-index:9999;
+  background:rgba(0,0,0,.88); display:flex; align-items:center; justify-content:center;
+  cursor:zoom-out;
+}
+.lightbox.hidden { display:none; }
+.lightbox img { max-width:90vw; max-height:90vh; object-fit:contain; border-radius:6px; box-shadow:0 8px 48px rgba(0,0,0,.7); }
+.lb-close {
+  position:fixed; top:14px; right:18px;
+  background:rgba(255,255,255,.12); border:none; border-radius:50%;
+  width:34px; height:34px; font-size:1.1em; color:#fff; cursor:pointer; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+}
+.lb-close:hover { background:rgba(255,255,255,.25); }
+/* ── YouTube embed ── */
+.yt-wrap { margin-top:10px; }
+.yt-wrap.hidden { display:none; }
+.yt-btns { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
+.yt-try { font-size:.74em; padding:3px 9px; }
+.yt-open { font-size:.74em; color:var(--vscode-textLink-foreground,#74b9ff); background:none; border:none; padding:0; cursor:pointer; text-decoration:underline; }
+.yt-open:hover { filter:brightness(1.2); }
+.yt-frame-wrap { border-radius:5px; overflow:hidden; background:#000; }
+.yt-frame-wrap iframe { display:block; width:100%; height:200px; border:none; }
+/* ── Vibrant debug ── */
+.dbg-wrap { margin-top:12px; padding-top:10px; border-top:1px solid var(--vscode-widget-border,rgba(255,255,255,.08)); }
+.dbg-wrap.hidden { display:none; }
+.dbg-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+.dbg-url { font-size:.68em; color:var(--vscode-descriptionForeground); word-break:break-all; margin-bottom:8px; font-family:monospace; }
+.dbg-swatches { display:flex; flex-wrap:wrap; gap:6px; }
+.dbg-sw { display:flex; flex-direction:column; align-items:center; gap:3px; }
+.dbg-dot { width:24px; height:24px; border-radius:50%; border:2px solid rgba(255,255,255,.15); }
+.dbg-label { font-size:.6em; color:var(--vscode-descriptionForeground); text-align:center; }
+.dbg-hex { font-size:.62em; color:var(--vscode-descriptionForeground); font-family:monospace; }
+/* ── history ── */
+.hemp { font-size:.8em; color:var(--vscode-descriptionForeground); padding:10px 0; }
+.hent {
+  display:flex; align-items:center; gap:8px;
+  padding:8px 9px; border-radius:5px; margin-bottom:4px;
+  background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.03));
+  border:1px solid transparent; transition:background .13s, border-color .13s;
+}
+.hent:hover { background:var(--vscode-list-hoverBackground,rgba(255,255,255,.07)); border-color:var(--vscode-widget-border,rgba(255,255,255,.1)); }
+.hsws { display:flex; gap:3px; flex-shrink:0; }
+.hsw  { width:12px; height:12px; border-radius:50%; border:1px solid rgba(255,255,255,.12); flex-shrink:0; }
+.hthumb { width:28px; height:28px; border-radius:3px; object-fit:cover; flex-shrink:0; background:rgba(255,255,255,.08); }
+.hinf { flex:1; min-width:0; }
+.hname { font-size:.82em; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hmeta { font-size:.7em; color:var(--vscode-descriptionForeground); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.hact  { display:flex; gap:4px; flex-shrink:0; }
+/* ── auto-refresh ── */
+.ar-card { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:14px; }
+.ar-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.ar-btn {
+  padding:5px 12px; font-size:.8em; border-radius:5px; border:1px solid var(--vscode-widget-border,rgba(255,255,255,.15));
+  background:transparent; color:var(--vscode-foreground); cursor:pointer; transition:background .12s,color .12s;
+}
+.ar-btn.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
+.ar-btn:hover:not(.active) { background:var(--vscode-list-hoverBackground,rgba(255,255,255,.06)); }
+.ar-intv { display:flex; align-items:center; gap:6px; }
+.ar-intv.hidden { display:none; }
+.ar-intv input[type=number] {
+  width:56px; padding:4px 7px; font:inherit; font-size:.82em;
+  background:var(--vscode-input-background,rgba(0,0,0,.3));
+  color:var(--vscode-input-foreground,var(--vscode-foreground));
+  border:1px solid var(--vscode-input-border,rgba(255,255,255,.2));
+  border-radius:4px; text-align:center;
+}
+.ar-intv span { font-size:.82em; color:var(--vscode-descriptionForeground); }
+.ar-hint { margin-top:8px; font-size:.74em; color:var(--vscode-descriptionForeground); }
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="28" height="28">
+    <path d="M64 6C29 6 6 29 6 58c0 14 6 26 16 34s24 14 38 14c10 0 18-4 22-12 2-5 0-12-4-16-3-3-3-8 0-10 3-2 8-1 11 2 5 5 13 4 19-2 14-14 14-50-18-58C82 7 73 6 64 6Z" fill="#6c5ce7"/>
+    <circle cx="38" cy="54" r="9" fill="#e17055"/><circle cx="55" cy="78" r="9" fill="#fdcb6e"/>
+    <circle cx="76" cy="82" r="9" fill="#00b894"/><circle cx="88" cy="50" r="9" fill="#74b9ff"/>
+    <circle cx="46" cy="38" r="9" fill="#fd79a8"/><circle cx="72" cy="28" r="8" fill="#a29bfe"/>
+    <ellipse cx="28" cy="78" rx="11" ry="13" fill="rgba(0,0,0,.3)"/>
+  </svg>
+  <h1>Discogs Color Theme</h1>
+</div>
+<p class="sub">Generate themes from random colours or real Discogs album art.</p>
+
+<!-- Scope toggle -->
+<div class="scope-row">
+  <span class="scope-lbl">Apply to:</span>
+  <div class="seg" id="scope-seg">
+    <button class="seg-btn active" id="scope-ws" title="Apply theme only to this window">
+      <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="14" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M1 5h14" stroke="currentColor" stroke-width="1"/></svg>
+      This window
+    </button>
+    <button class="seg-btn" id="scope-gl" title="Apply theme to all VS Code windows">
+      <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="6" y="7" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+      All windows
+    </button>
+  </div>
+</div>
+
+<!-- Actions -->
+<div class="actions">
+  <button class="bp" id="bg">
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg>
+    Generate Random
+  </button>
+  <button class="bdiscogs" id="bd">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+      <circle cx="12" cy="12" r="10"/>
+      <circle cx="12" cy="12" r="4.5"/>
+      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
+      <line x1="12" y1="7.5" x2="12" y2="2"/>
+    </svg>
+    From Discogs
+  </button>
+  <button class="bs" id="br" disabled>
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg>
+    Reset
+  </button>
+</div>
+
+<div class="sbar hidden" id="sb"><div class="spin"></div><span id="st"></span></div>
+
+<!-- Current theme -->
+<div class="sec">
+  <div class="sec-hd"><span class="lbl">Current Theme</span></div>
+  <div class="card">
+    <div class="swatches empty" id="sws">
+      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
+      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
+    </div>
+    <div class="tname" id="tn">— No theme generated yet —</div>
+    <div class="tmeta" id="tm"></div>
+    <div class="erow hidden" id="er">
+      <button class="bsm" id="bcp">📋 Copy JSON</button>
+    </div>
+  </div>
+</div>
+
+<!-- Discogs release card -->
+<div class="sec" id="dsec">
+  <div class="sec-hd"><span class="lbl">Discogs Release</span></div>
+  <div class="dcrd hidden" id="dcrd">
+    <div class="dcrd-top">
+      <img class="dart" id="dimg" src="" alt="Album art">
+      <div class="dinf">
+        <div class="dart-nm" id="dart"></div>
+        <div class="dtitle"  id="dttl"></div>
+        <div class="dyear"   id="dyr"></div>
+        <div class="dmeta2"  id="dmeta2"></div>
+        <div class="dtags"   id="dtgs"></div>
+        <div class="dtracks" id="dtks"></div>
+        <button class="blink" id="dlnk">View on Discogs ↗</button>
+      </div>
+    </div>
+    <!-- YouTube embed (two methods + external link) -->
+    <div class="yt-wrap hidden" id="yt-wrap">
+      <div class="yt-btns">
+        <button class="bsm yt-try" id="yt-toggle">Try youtube.com embed</button>
+        <button class="yt-open" id="yt-ext">▶ Open in YouTube ↗</button>
+      </div>
+      <div class="yt-frame-wrap">
+        <iframe id="yt-frame" allowfullscreen
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture">
+        </iframe>
+      </div>
+    </div>
+    <!-- Vibrant debug info -->
+    <div class="dbg-wrap hidden" id="dbg-wrap">
+      <div class="dbg-hd">
+        <span class="lbl" style="font-size:.62em">Vibrant Extraction</span>
+        <button class="blink" style="font-size:.72em" id="dbg-hide">Hide</button>
+      </div>
+      <div class="dbg-url" id="dbg-url"></div>
+      <div class="dbg-swatches" id="dbg-swatches"></div>
+    </div>
+  </div>
+</div>
+
+<!-- History -->
+<div class="sec">
+  <div class="sec-hd">
+    <span class="lbl">History</span>
+    <button class="bdanger" id="bclr">Clear All</button>
+  </div>
+  <div id="hlist"><div class="hemp">No themes generated yet.</div></div>
+</div>
+
+<!-- Auto-Refresh -->
+<div class="sec">
+  <div class="sec-hd"><span class="lbl">Auto-Refresh</span></div>
+  <div class="ar-card">
+    <div class="ar-row">
+      <button class="ar-btn active" data-mode="off">Off</button>
+      <button class="ar-btn" data-mode="onOpen">On workspace open</button>
+      <button class="ar-btn" data-mode="interval">Every</button>
+      <div class="ar-intv hidden" id="ar-intv">
+        <input type="number" id="ar-hours" min="1" max="168" value="2">
+        <span>hours</span>
+      </div>
+    </div>
+    <div class="ar-hint" id="ar-hint"></div>
+  </div>
+</div>
+
+<!-- Image lightbox -->
+<div class="lightbox hidden" id="lightbox">
+  <button class="lb-close" id="lb-close" title="Close">✕</button>
+  <img id="lb-img" src="" alt="Full-size album art">
+</div>
+
+<script nonce="${nonce}">
+(function () {
+  const vsc = acquireVsCodeApi();
+
+  // ── state ──────────────────────────────────────────────────────────────────
+  let current   = null;
+  let curImgUri = null;
+
+  // ── refs ───────────────────────────────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const bg=$('bg'), bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr');
+  const sb=$('sb'), st=$('st');
+  const sws=$('sws'), tn=$('tn'), tm=$('tm'), er=$('er');
+  const dcrd=$('dcrd'), dimg=$('dimg');
+  const hlist=$('hlist');
+  const scopeWs=$('scope-ws'), scopeGl=$('scope-gl');
+  const ytWrap=$('yt-wrap'), ytFrame=$('yt-frame');
+  const arHoursWrap=$('ar-intv'), arHoursInput=$('ar-hours'), arHint=$('ar-hint');
+  const lightbox=$('lightbox'), lbImg=$('lb-img');
+  const dbgWrap=$('dbg-wrap'), dbgUrl=$('dbg-url'), dbgSwatches=$('dbg-swatches');
+
+  // current YouTube video ID and which domain is active
+  let currentVideoId = null;
+  let ytUseNocookie  = true;
+
+  // ── button handlers ────────────────────────────────────────────────────────
+  bg.onclick   = () => { hideStatus(); vsc.postMessage({ command:'generate' }); };
+  bd.onclick   = () => vsc.postMessage({ command:'fromDiscogs' });
+  br.onclick   = () => vsc.postMessage({ command:'reset' });
+  bcp.onclick  = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
+  bclr.onclick = () => vsc.postMessage({ command:'clearHistory' });
+  $('dlnk').onclick = () => { if (current?.discogs) vsc.postMessage({ command:'openUrl', url:current.discogs.uri }); };
+
+  // ── lightbox ───────────────────────────────────────────────────────────────
+  dimg.onclick = () => {
+    if (!curImgUri && !dimg.src) { return; }
+    lbImg.src = curImgUri || dimg.src;
+    lightbox.classList.remove('hidden');
+  };
+  lightbox.onclick = (e) => {
+    if (e.target === lightbox || e.target.id === 'lb-close') {
+      lightbox.classList.add('hidden');
+      lbImg.src = '';
+    }
+  };
+
+  // ── YouTube toggle ─────────────────────────────────────────────────────────
+  $('yt-toggle').onclick = () => {
+    ytUseNocookie = !ytUseNocookie;
+    $('yt-toggle').textContent = ytUseNocookie ? 'Try youtube.com embed' : 'Try youtube-nocookie.com embed';
+    if (currentVideoId) { setYtSrc(currentVideoId); }
+  };
+  $('yt-ext').onclick = () => {
+    if (currentVideoId) {
+      vsc.postMessage({ command:'openUrl', url:\`https://www.youtube.com/watch?v=\${currentVideoId}\` });
+    }
+  };
+  $('dbg-hide').onclick = () => { dbgWrap.classList.add('hidden'); };
+
+  function setYtSrc(videoId) {
+    const domain = ytUseNocookie ? 'www.youtube-nocookie.com' : 'www.youtube.com';
+    ytFrame.src = \`https://\${domain}/embed/\${videoId}?rel=0&modestbranding=1\`;
+  }
+
+  // ── scope toggle ───────────────────────────────────────────────────────────
+  scopeWs.onclick = () => setScopeUI(true);
+  scopeGl.onclick = () => setScopeUI(false);
+
+  function setScopeUI(useWorkspace) {
+    scopeWs.classList.toggle('active', useWorkspace);
+    scopeGl.classList.toggle('active', !useWorkspace);
+    vsc.postMessage({ command:'setScope', useWorkspace });
+  }
+
+  // ── auto-refresh controls ──────────────────────────────────────────────────
+  document.querySelectorAll('.ar-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const mode = btn.dataset.mode;
+      document.querySelectorAll('.ar-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      arHoursWrap.classList.toggle('hidden', mode !== 'interval');
+      updateArHint(mode, +arHoursInput.value || 2);
+      sendAutoRefresh(mode);
+    });
+  });
+
+  arHoursInput.addEventListener('change', () => {
+    const hrs = Math.max(1, Math.min(168, +arHoursInput.value || 1));
+    arHoursInput.value = hrs;
+    const mode = document.querySelector('.ar-btn.active')?.dataset?.mode || 'off';
+    updateArHint(mode, hrs);
+    sendAutoRefresh(mode);
+  });
+
+  function sendAutoRefresh(mode) {
+    vsc.postMessage({
+      command: 'setAutoRefresh',
+      config: { mode, intervalHours: +arHoursInput.value || 2 },
+    });
+  }
+
+  function updateArHint(mode, hrs) {
+    if (mode === 'off')      { arHint.textContent = ''; }
+    else if (mode === 'onOpen')   { arHint.textContent = 'A new Discogs theme will load each time this workspace opens.'; }
+    else if (mode === 'interval') { arHint.textContent = \`A new Discogs theme will load every \${hrs} hour\${hrs===1?'':'s'}.\`; }
+  }
+
+  // ── extension messages ─────────────────────────────────────────────────────
+  window.addEventListener('message', ({ data: msg }) => {
+    switch (msg.command) {
+
+      case 'statusUpdate':
+        showStatus(msg.message, false);
+        break;
+
+      case 'discogsError':
+        showStatus(msg.message, true);
+        setTimeout(hideStatus, 5000);
+        break;
+
+      case 'discogsImageReady': {
+        curImgUri = msg.imageDataUri;
+        renderDiscogsCard(msg.release, msg.imageDataUri);
+        break;
+      }
+
+      case 'themeApplied': {
+        hideStatus();
+        current = msg.entry;
+        br.disabled = false;
+        renderCurrent(msg.entry);
+        if (msg.entry.discogs) {
+          const imgSrc = curImgUri || msg.entry.discogs.thumbDataUri || '';
+          renderDiscogsCard(msg.entry.discogs, imgSrc);
+        } else {
+          hideDiscogs();
+          curImgUri = null;
+        }
+        break;
+      }
+
+      case 'themeReset':
+        current = null; curImgUri = null;
+        br.disabled = true;
+        clearCurrent();
+        hideDiscogs();
+        break;
+
+      case 'historyUpdated':
+        renderHistory(msg.history);
+        break;
+
+      case 'copySuccess':
+        flashBtn(bcp, '✓ Copied!');
+        break;
+
+      case 'vibrantDebug': {
+        const { imageUrl, palette } = msg;
+        dbgUrl.textContent = 'Image URL: ' + imageUrl;
+        dbgSwatches.innerHTML = '';
+        const swatchOrder = [
+          ['Vibrant',      palette.vibrant],
+          ['Dark Vibrant', palette.darkVibrant],
+          ['Light Vibrant',palette.lightVibrant],
+          ['Muted',        palette.muted],
+          ['Dark Muted',   palette.darkMuted],
+          ['Light Muted',  palette.lightMuted],
+        ];
+        swatchOrder.forEach(([label, hex]) => {
+          if (!hex) { return; }
+          const d = document.createElement('div');
+          d.className = 'dbg-sw';
+          d.innerHTML = \`<div class="dbg-dot" style="background:\${hex}"></div>
+            <div class="dbg-label">\${label}</div>
+            <div class="dbg-hex">\${hex}</div>\`;
+          dbgSwatches.appendChild(d);
+        });
+        dbgWrap.classList.remove('hidden');
+        break;
+      }
+
+      case 'stateSync':
+        // Restore scope toggle
+        if (msg.scope === 'workspace') { scopeWs.classList.add('active'); scopeGl.classList.remove('active'); }
+        else { scopeGl.classList.add('active'); scopeWs.classList.remove('active'); }
+        // Restore auto-refresh
+        if (msg.autoRefresh) {
+          const { mode, intervalHours } = msg.autoRefresh;
+          document.querySelectorAll('.ar-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.mode === mode);
+          });
+          arHoursInput.value = intervalHours || 2;
+          arHoursWrap.classList.toggle('hidden', mode !== 'interval');
+          updateArHint(mode, intervalHours);
+        }
+        break;
+    }
+  });
+
+  // ── current theme card ─────────────────────────────────────────────────────
+  function renderCurrent(e) {
+    sws.classList.remove('empty');
+    sws.querySelectorAll('.sw').forEach((d,i) => { if (e.swatches[i]) d.style.background = e.swatches[i]; });
+    const mc = e.isDark ? 'bd' : 'bl';
+    const ml = e.isDark ? 'Dark' : 'Light';
+    const sb2 = e.source==='discogs' ? ' <span class="badge bdisc">Discogs</span>' : '';
+    tn.innerHTML = esc(e.name) + \` <span class="badge \${mc}">\${ml}</span>\` + sb2;
+    tm.textContent = relT(e.timestamp);
+    er.classList.remove('hidden');
+  }
+
+  function clearCurrent() {
+    sws.classList.add('empty');
+    sws.querySelectorAll('.sw').forEach(s => s.style.background='');
+    tn.textContent = '— No theme generated yet —';
+    tm.textContent = '';
+    er.classList.add('hidden');
+  }
+
+  // ── discogs card ────────────────────────────────────────────────────────────
+  function renderDiscogsCard(rel, imgSrc) {
+    dcrd.classList.remove('hidden');
+    dimg.src = imgSrc || '';
+    $('dart').textContent  = rel.artists || '';
+    $('dttl').textContent  = rel.title   || '';
+    $('dyr').textContent   = [rel.year, rel.country].filter(Boolean).join(' · ');
+
+    // Format + Label line
+    const meta2 = $('dmeta2');
+    meta2.innerHTML = '';
+    if (rel.format) {
+      const s = document.createElement('span');
+      s.textContent = '💿 ' + rel.format;
+      meta2.appendChild(s);
+    }
+    if (rel.label) {
+      const s = document.createElement('span');
+      s.textContent = '🏷 ' + rel.label;
+      meta2.appendChild(s);
+    }
+
+    // Genre + Style tags
+    const tgs = $('dtgs'); tgs.innerHTML = '';
+    [...(rel.genres||[]), ...(rel.styles||[])].slice(0,8).forEach(t => {
+      const s=document.createElement('span'); s.className='tag'; s.textContent=t; tgs.appendChild(s);
+    });
+
+    const tkEl = $('dtks');
+    tkEl.textContent = rel.tracklist?.length ? rel.tracklist.slice(0,6).join(' · ') : '';
+
+    // YouTube embed
+    if (rel.videoId) {
+      currentVideoId = rel.videoId;
+      ytUseNocookie  = true;
+      $('yt-toggle').textContent = 'Try youtube.com embed';
+      setYtSrc(rel.videoId);
+      ytWrap.classList.remove('hidden');
+    } else {
+      currentVideoId = null;
+      ytWrap.classList.add('hidden');
+      ytFrame.src = '';
+    }
+  }
+
+  function hideDiscogs() {
+    dcrd.classList.add('hidden');
+    ytWrap.classList.add('hidden');
+    ytFrame.src = '';
+    currentVideoId = null;
+    dbgWrap.classList.add('hidden');
+  }
+
+  // ── history ─────────────────────────────────────────────────────────────────
+  function renderHistory(hist) {
+    if (!hist.length) { hlist.innerHTML='<div class="hemp">No themes generated yet.</div>'; return; }
+    hlist.innerHTML = '';
+    hist.forEach(e => {
+      const el = document.createElement('div');
+      el.className = 'hent';
+      const mc = e.isDark ? 'bd' : 'bl';
+      const srcTxt = e.source==='discogs' ? ' <span class="badge bdisc" style="font-size:.62em">●</span>' : '';
+      const thumbHtml = e.discogs?.thumbDataUri
+        ? \`<img class="hthumb" src="\${e.discogs.thumbDataUri}" alt="">\`
+        : '';
+      const meta = e.discogs
+        ? \`\${relT(e.timestamp)} · \${esc(e.discogs.artists)} — \${esc(e.discogs.title)} (\${e.discogs.year})\`
+        : relT(e.timestamp);
+
+      el.innerHTML = \`
+        <div class="hsws">\${e.swatches.map(c=>\`<div class="hsw" style="background:\${c}"></div>\`).join('')}</div>
+        \${thumbHtml}
+        <div class="hinf">
+          <div class="hname"><span class="badge \${mc}">\${e.isDark?'◆':'◇'}</span> \${esc(e.name)}\${srcTxt}</div>
+          <div class="hmeta">\${meta}</div>
+        </div>
+        <div class="hact">
+          <button class="bicon" title="Load theme" data-act="load">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/><path d="M7.646 11.854a.5.5 0 0 0 .708 0l3-3a.5.5 0 0 0-.708-.708L8.5 10.293V1.5a.5.5 0 0 0-1 0v8.793L5.354 8.146a.5.5 0 1 0-.708.708l3 3z"/></svg>
+          </button>
+          <button class="bicon" title="Copy JSON" data-act="copy">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"/><path d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"/></svg>
+          </button>
+          <button class="bicon" title="Delete" data-act="delete" style="color:var(--vscode-errorForeground,#f38ba8)">
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/><path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/></svg>
+          </button>
+        </div>\`;
+
+      el.querySelector('[data-act="load"]').onclick = () => vsc.postMessage({ command:'loadEntry', id:e.id });
+      el.querySelector('[data-act="copy"]').onclick = (ev) => {
+        vsc.postMessage({ command:'copyJson', id:e.id });
+        flashBtn(ev.currentTarget, '✓');
+      };
+      el.querySelector('[data-act="delete"]').onclick = () => {
+        el.style.opacity = '.4';
+        vsc.postMessage({ command:'deleteEntry', id:e.id });
+      };
+
+      hlist.appendChild(el);
+    });
+  }
+
+  // ── status bar ──────────────────────────────────────────────────────────────
+  function showStatus(msg, isErr) {
+    sb.classList.remove('hidden','err');
+    if (isErr) sb.classList.add('err');
+    st.textContent = msg;
+  }
+  function hideStatus() { sb.classList.add('hidden'); }
+
+  // ── utils ───────────────────────────────────────────────────────────────────
+  function esc(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function relT(ts) {
+    const d = Date.now()-ts;
+    if (d<60000)    return 'just now';
+    if (d<3600000)  return Math.floor(d/60000)+'m ago';
+    if (d<86400000) return Math.floor(d/3600000)+'h ago';
+    return Math.floor(d/86400000)+'d ago';
+  }
+  function flashBtn(btn, label) {
+    const orig = btn.innerHTML;
+    btn.textContent = label;
+    setTimeout(() => { btn.innerHTML = orig; }, 1500);
+  }
+}());
+</script>
+</body>
+</html>`;
+  }
+}
