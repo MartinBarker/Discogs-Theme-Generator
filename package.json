@@ -1,6 +1,7 @@
 {
   "name": "discogs-theme-generator",
   "displayName": "Discogs Theme Generator",
+  "publisher": "MartinBarker",
   "description": "Randomly generate and apply beautiful color themes to your VS Code or Cursor window instantly.",
   "version": "0.0.1",
   "repository": {
