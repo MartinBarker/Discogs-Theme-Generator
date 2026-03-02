@@ -1,7 +1,7 @@
 import * as https from 'https';
 import * as http from 'http';
 
-const UA = 'DiscogsColorTheme/0.0.6 +https://github.com/example/discogs-color-theme';
+const UA = 'DiscogsThemeGenerator/0.0.1 +https://github.com/example/discogs-theme-generator';
 
 export interface DiscogsRelease {
   id: number;

@@ -1,11 +1,11 @@
 {
-  "name": "discogs-color-theme",
-  "displayName": "Discogs Color Theme",
+  "name": "discogs-theme-generator",
+  "displayName": "Discogs Theme Generator",
   "description": "Randomly generate and apply beautiful color themes to your VS Code or Cursor window instantly.",
   "version": "0.0.1",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-username/discogs-color-theme.git"
+    "url": "https://github.com/your-username/discogs-theme-generator.git"
   },
   "icon": "images/icon.png",
   "engines": {
@@ -20,9 +20,9 @@
   "contributes": {
     "commands": [
       {
-        "command": "discogsColorTheme.open",
-        "title": "Open Discogs Color Theme",
-        "category": "Discogs Color Theme",
+        "command": "discogsThemeGenerator.open",
+        "title": "Open Discogs Theme Generator",
+        "category": "Discogs Theme Generator",
         "icon": "images/icon.png"
       }
     ]

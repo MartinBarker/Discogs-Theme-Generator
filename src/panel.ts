@@ -6,16 +6,16 @@ import {
   toSummary, discogsFromRelease, HistoryEntry,
 } from './history';
 
-const PREV_KEY  = 'discogsColorTheme.prev';   // { scope, tokens }
-const SCOPE_KEY = 'discogsColorTheme.workspaceScope'; // true = workspace
-const AR_KEY    = 'discogsColorTheme.autoRefresh';    // AutoRefreshConfig
+const PREV_KEY  = 'discogsThemeGenerator.prev';   // { scope, tokens }
+const SCOPE_KEY = 'discogsThemeGenerator.workspaceScope'; // true = workspace
+const AR_KEY    = 'discogsThemeGenerator.autoRefresh';    // AutoRefreshConfig
 
 interface AutoRefreshConfig {
   mode: 'off' | 'onOpen' | 'interval';
   intervalHours: number;
 }
 
-export class DiscogsColorThemePanel {
+export class DiscogsThemeGeneratorPanel {
   private panel: vscode.WebviewPanel | undefined;
   private readonly ctx: vscode.ExtensionContext;
   private autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -28,7 +28,7 @@ export class DiscogsColorThemePanel {
   openOrReveal() {
     if (this.panel) { this.panel.reveal(vscode.ViewColumn.One); return; }
     this.panel = vscode.window.createWebviewPanel(
-      'discogsColorTheme', 'Discogs Color Theme', vscode.ViewColumn.One,
+      'discogsThemeGenerator', 'Discogs Theme Generator', vscode.ViewColumn.One,
       { enableScripts: true, retainContextWhenHidden: true },
     );
     this.panel.webview.html = this.buildHtml();
@@ -295,7 +295,7 @@ export class DiscogsColorThemePanel {
     if (!tokens) { return; }
     const json = JSON.stringify({
       name: themeName,
-      generator: 'Discogs Color Theme',
+      generator: 'Discogs Theme Generator',
       'workbench.colorCustomizations': tokens,
     }, null, 2);
     await vscode.env.clipboard.writeText(json);
@@ -321,7 +321,7 @@ export class DiscogsColorThemePanel {
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy"
   content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; frame-src https://www.youtube-nocookie.com;">
-<title>Discogs Color Theme</title>
+<title>Discogs Theme Generator</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -505,7 +505,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     <circle cx="46" cy="38" r="9" fill="#fd79a8"/><circle cx="72" cy="28" r="8" fill="#a29bfe"/>
     <ellipse cx="28" cy="78" rx="11" ry="13" fill="rgba(0,0,0,.3)"/>
   </svg>
-  <h1>Discogs Color Theme</h1>
+  <h1>Discogs Theme Generator</h1>
 </div>
 <p class="sub">Generate themes from random colours or real Discogs album art.</p>
 

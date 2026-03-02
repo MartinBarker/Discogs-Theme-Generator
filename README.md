@@ -1,4 +1,4 @@
-# Discogs Color Theme
+# Discogs Theme Generator
 
 Generate color themes from Discogs album art. Pick a random vinyl release, extract colors from its cover, and apply the palette to your editor.
 
@@ -9,7 +9,7 @@ Works in **VS Code**, **Cursor**, and any editor that supports VS Code extension
 ## Quick Start
 
 1. Install the extension (from VSIX or marketplace)
-2. `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac) → **Open Discogs Color Theme**
+2. `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac) → **Open Discogs Theme Generator**
 3. Click **From Discogs** — a random release is fetched and its colors become your theme
 
 ---
@@ -40,7 +40,7 @@ npm install -g @vscode/vsce
 vsce package
 ```
 
-This produces a file like `discogs-color-theme-0.0.7.vsix` in the project root.
+This produces a file like `discogs-theme-generator-0.0.1.vsix` in the project root.
 
 ---
 
@@ -48,10 +48,10 @@ This produces a file like `discogs-color-theme-0.0.7.vsix` in the project root.
 
 ```bash
 # VS Code
-code --install-extension discogs-color-theme-0.0.7.vsix
+code --install-extension discogs-theme-generator-0.0.1.vsix
 
 # Cursor
-cursor --install-extension discogs-color-theme-0.0.7.vsix
+cursor --install-extension discogs-theme-generator-0.0.1.vsix
 ```
 
 Or: **Extensions** → **⋯** → **Install from VSIX…**

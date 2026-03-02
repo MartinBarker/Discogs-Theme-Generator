@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { ColorTokens } from './colorTheme';
 import { DiscogsRelease } from './discogsApi';
 
-const KEY = 'discogsColorTheme.history';
+const KEY = 'discogsThemeGenerator.history';
 const MAX = 20;
 
 export interface StoredDiscogsInfo {

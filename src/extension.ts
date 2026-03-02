@@ -1,11 +1,11 @@
 import * as vscode from 'vscode';
-import { DiscogsColorThemePanel } from './panel';
+import { DiscogsThemeGeneratorPanel } from './panel';
 
 export function activate(context: vscode.ExtensionContext) {
-  const provider = new DiscogsColorThemePanel(context);
+  const provider = new DiscogsThemeGeneratorPanel(context);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('discogsColorTheme.open', () => {
+    vscode.commands.registerCommand('discogsThemeGenerator.open', () => {
       provider.openOrReveal();
     })
   );
