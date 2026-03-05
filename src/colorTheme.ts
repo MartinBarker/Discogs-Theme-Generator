@@ -51,21 +51,29 @@ function fg(bgHex: string, hue: number, minRatio: number = 4.5): string {
   // Choose a subtle saturation — keeps the "tinted neutral" look
   const sat = 12;
 
-  if (goLight) {
-    // Start at a lightness that feels "muted" for lower ratios
+  const tryLight = (): string | null => {
     const start = minRatio <= 2.5 ? 45 : minRatio <= 3.0 ? 58 : 88;
     for (let l = start; l <= 100; l++) {
       const c = hslToHex(hue, sat, l);
       if (contrastRatio(c, bgHex) >= minRatio) { return c; }
     }
-    return '#ffffff';
-  } else {
+    return null;
+  };
+
+  const tryDark = (): string | null => {
     const start = minRatio <= 2.5 ? 55 : minRatio <= 3.0 ? 42 : 12;
     for (let l = start; l >= 0; l--) {
       const c = hslToHex(hue, sat, l);
       if (contrastRatio(c, bgHex) >= minRatio) { return c; }
     }
-    return '#000000';
+    return null;
+  };
+
+  // Try preferred direction first; fall back to the other if it fails
+  if (goLight) {
+    return tryLight() ?? tryDark() ?? '#ffffff';
+  } else {
+    return tryDark() ?? tryLight() ?? '#000000';
   }
 }
 
@@ -75,6 +83,24 @@ const fgAA   = (bg: string, h: number) => fg(bg, h, 4.5);
 const fgMute = (bg: string, h: number) => fg(bg, h, 3.0);
 /** Subtle foreground — ≥ 2.5 contrast, used for line numbers / hints */
 const fgHint = (bg: string, h: number) => fg(bg, h, 2.5);
+
+/**
+ * Editor text color for maximum readability on the editor background.
+ * Uses the same hue as the background; chooses either 60% darker or 60% lighter
+ * (in HSL lightness) so that contrast ratio is maximised for .ts, .js, .json, etc.
+ */
+function editorForegroundForReadability(bgHex: string, hue: number): string {
+  const { h, s, l } = hexToHslObj(bgHex);
+  const useHue = h;
+  const useSat = Math.min(s, 25);
+  const darkL  = clamp(l - 60, 0, 100);
+  const lightL = clamp(l + 60, 0, 100);
+  const darkFg  = hslToHex(useHue, useSat, darkL);
+  const lightFg = hslToHex(useHue, useSat, lightL);
+  const ratioDark  = contrastRatio(darkFg, bgHex);
+  const ratioLight = contrastRatio(lightFg, bgHex);
+  return ratioDark >= ratioLight ? darkFg : lightFg;
+}
 
 /** Append 2-digit alpha to a 6-digit hex: alpha('#fff', 0.5) → '#ffffff80' */
 function alpha(hex: string, opacity: number): string {
@@ -166,7 +192,10 @@ export interface VibrantPaletteColors {
  * ALL colour decisions derive exclusively from the six Vibrant swatches.
  * The swatches shown in the UI are the actual palette colours from the image.
  */
-export function buildThemeFromVibrantPalette(palette: VibrantPaletteColors): GeneratedTheme {
+export function buildThemeFromVibrantPalette(
+  palette: VibrantPaletteColors,
+  options?: { isDark?: boolean; rollIndex?: number },
+): GeneratedTheme {
   const all = [
     palette.vibrant, palette.darkVibrant, palette.lightVibrant,
     palette.muted, palette.darkMuted, palette.lightMuted,
@@ -174,20 +203,38 @@ export function buildThemeFromVibrantPalette(palette: VibrantPaletteColors): Gen
 
   if (all.length < 2) { return generateColorTheme(); }
 
-  // dark/light: average relative luminance of the full palette
-  const avgLum = all.map(relativeLuminance).reduce((a, b) => a + b, 0) / all.length;
-  const isDark = avgLum < 0.30;
+  const isDark  = options?.isDark   ?? false;
+  const rollIdx = options?.rollIndex ?? 0;
 
-  // Background seed: darkest colour for dark themes, lightest for light themes
-  const sortedByL = [...all].sort((a, b) => hexToHslObj(a).l - hexToHslObj(b).l);
-  const bgHex  = isDark ? sortedByL[0] : sortedByL[sortedByL.length - 1];
-  const bgHsl  = hexToHslObj(bgHex);
+  // Ordered bg candidate lists — rotate through them via rollIdx for re-roll.
+  // Light mode prefers light swatches; dark mode prefers dark swatches.
+  const lightBgPool = [
+    palette.lightMuted, palette.lightVibrant, palette.muted, palette.vibrant,
+  ].filter((c): c is string => c !== null);
 
-  // Accent seed: Vibrant first, then DarkVibrant, then most-saturated swatch
+  const darkBgPool = [
+    palette.darkMuted, palette.darkVibrant, palette.muted, palette.vibrant,
+  ].filter((c): c is string => c !== null);
+
+  const bgPool = isDark ? darkBgPool : lightBgPool;
+
+  // Fallback: sorted by lightness (desc for light, asc for dark)
+  const byLight = [...all].sort((a, b) =>
+    isDark ? hexToHslObj(a).l - hexToHslObj(b).l
+           : hexToHslObj(b).l - hexToHslObj(a).l,
+  );
+  const effectivePool = bgPool.length > 0 ? bgPool : byLight;
+  const bgHex = effectivePool[rollIdx % effectivePool.length];
+  const bgHsl = hexToHslObj(bgHex);
+
+  const textHex = isDark
+    ? (palette.lightMuted ?? palette.lightVibrant ?? palette.muted ?? '#f8fafc')
+    : (palette.darkMuted  ?? palette.darkVibrant  ?? palette.muted ?? '#111827');
+
+  // Accent: most saturated swatch that isn't the current bg
   const accentHex =
-    palette.vibrant ??
-    palette.darkVibrant ??
-    [...all].sort((a, b) => hexToHslObj(b).s - hexToHslObj(a).s)[0];
+    [...all].filter(c => c !== bgHex).sort((a, b) => hexToHslObj(b).s - hexToHslObj(a).s)[0]
+    ?? (palette.vibrant ?? palette.darkVibrant ?? all[0]);
   const accentHsl = hexToHslObj(accentHex);
 
   const theme = generateColorTheme({
@@ -196,16 +243,29 @@ export function buildThemeFromVibrantPalette(palette: VibrantPaletteColors): Gen
     sat:             clamp(bgHsl.s, 10, 55),
     accentHue:       accentHsl.h,
     accentSat:       clamp(accentHsl.s, 45, 95),
-    // Anchor backgrounds and accent to the actual image swatch lightness values
     baseLightness:   bgHsl.l,
     accentLightness: accentHsl.l,
   });
 
-  // Replace default swatches with the real palette colours for display
-  if (all.length >= 3) {
-    theme.swatches = all.slice(0, 6);
+  const forceTextKeys = [
+    'foreground', 'editor.foreground', 'sideBar.foreground', 'panel.foreground',
+    'terminal.foreground', 'activityBar.foreground', 'titleBar.activeForeground',
+    'statusBar.noFolderForeground',
+  ];
+  const forceBgKeys = [
+    'editor.background', 'sideBar.background', 'panel.background',
+    'terminal.background', 'activityBar.background', 'titleBar.activeBackground',
+    'welcomePage.background',
+  ];
+
+  for (const k of forceTextKeys) {
+    if (theme.tokens[k] !== undefined) { theme.tokens[k] = textHex; }
+  }
+  for (const k of forceBgKeys) {
+    if (theme.tokens[k] !== undefined) { theme.tokens[k] = bgHex; }
   }
 
+  if (all.length >= 3) { theme.swatches = all.slice(0, 6); }
   return theme;
 }
 
@@ -269,6 +329,9 @@ export function generateColorTheme(params?: ThemeParams): GeneratedTheme {
   const f2     = fgAA(bg2, hue);   const f2m = fgMute(bg2, hue);  const f2h = fgHint(bg2, hue);
   const f3     = fgAA(bg3, hue);   const f3m = fgMute(bg3, hue);
 
+  // Editor text: 30% darker or 30% lighter than editor bg, whichever gives better contrast
+  const editorFg = editorForegroundForReadability(bg2, hue);
+
   // ── Widget / overlay backgrounds (menus, dropdowns, suggestions, etc.) ──────
   const widgetBg = isDark
     ? hslToHex(hue, sat, clamp(relativeLuminance(bg2) < 0.05 ? 20 : 16, 12, 28))
@@ -321,21 +384,21 @@ export function generateColorTheme(params?: ThemeParams): GeneratedTheme {
     'textBlockQuote.background':                       bg1,
     'textBlockQuote.border':                           accent,
     'textCodeBlock.background':                        bg3,
-    'textPreformat.foreground':                        f2,
+    'textPreformat.foreground':                        editorFg,
     'textSeparator.foreground':                        f2h,
     'icon.foreground':                                 f2m,
     'sash.hoverBorder':                                accent,
 
     // ── Editor ────────────────────────────────────────────────────────────────
     'editor.background':                               bg2,
-    'editor.foreground':                               f2,
-    'editorLineNumber.foreground':                     f2h,
-    'editorLineNumber.activeForeground':               f2m,
-    'editorLineNumber.dimmedForeground':               f2h,
+    'editor.foreground':                               editorFg,
+    'editorLineNumber.foreground':                     editorFg,
+    'editorLineNumber.activeForeground':               editorFg,
+    'editorLineNumber.dimmedForeground':               editorFg,
     'editorCursor.background':                         bg2,
     'editorCursor.foreground':                         accent,
     'editor.selectionBackground':                      selBg,
-    'editor.selectionForeground':                      fgAA(selBg.slice(0, 7), hue),
+    'editor.selectionForeground':                      editorFg,
     'editor.inactiveSelectionBackground':              alpha(accent, isDark ? 0.18 : 0.13),
     'editor.selectionHighlightBackground':             alpha(accent, isDark ? 0.22 : 0.16),
     'editor.wordHighlightBackground':                  alpha(accent, isDark ? 0.22 : 0.16),
@@ -351,8 +414,8 @@ export function generateColorTheme(params?: ThemeParams): GeneratedTheme {
     'editorWhitespace.foreground':                     alpha(f2h, 0.45),
     'editorIndentGuide.background1':                   alpha(f2h, 0.22),
     'editorIndentGuide.activeBackground1':             alpha(f2m, 0.50),
-    'editorRuler.foreground':                          alpha(f2h, 0.28),
-    'editorCodeLens.foreground':                       f2h,
+    'editorRuler.foreground':                          alpha(editorFg, 0.28),
+    'editorCodeLens.foreground':                       editorFg,
     'editorBracketMatch.background':                   alpha(accent, 0.2),
     'editorBracketMatch.border':                       accent,
     'editorBracketHighlight.foreground1':              accent,
@@ -398,7 +461,7 @@ export function generateColorTheme(params?: ThemeParams): GeneratedTheme {
     'editorHoverWidget.border':                        border,
     'editorHoverWidget.foreground':                    widgetFg,
     'editorHoverWidget.statusBarBackground':           isDark ? bg3 : bg1,
-    'editorGhostText.foreground':                      f2h,
+    'editorGhostText.foreground':                      editorFg,
     'editorGhostText.background':                      alpha(bg2, 0),
 
     // ── Activity bar ──────────────────────────────────────────────────────────
@@ -513,7 +576,7 @@ export function generateColorTheme(params?: ThemeParams): GeneratedTheme {
     'terminal.foreground':                             f2,
     'terminal.border':                                 border,
     'terminal.selectionBackground':                    selBg,
-    'terminal.selectionForeground':                    fgAA(selBg.slice(0, 7), hue),
+    'terminal.selectionForeground':                    f2,
     'terminal.inactiveSelectionBackground':            alpha(accent, isDark ? 0.18 : 0.13),
     'terminalCursor.background':                       bg2,
     'terminalCursor.foreground':                       accent,

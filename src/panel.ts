@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { generateColorTheme, buildThemeFromVibrantPalette, ColorTokens, GeneratedTheme } from './colorTheme';
+import { generateColorTheme, buildThemeFromVibrantPalette, ColorTokens, GeneratedTheme, VibrantPaletteColors } from './colorTheme';
 import { fetchRandomRelease, fetchReleaseById, searchAndFetchRelease, fetchImageBuffer, fetchImageDataUri, extractVibrantPalette, DiscogsRelease } from './discogsApi';
 import {
   getHistory, pushHistory, deleteEntry, clearHistory,
@@ -20,6 +20,10 @@ export class DiscogsThemeGeneratorPanel {
   private panel: vscode.WebviewPanel | undefined;
   private readonly ctx: vscode.ExtensionContext;
   private autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastPalette:   VibrantPaletteColors | undefined;
+  private lastIsDark:    boolean = false;
+  private lastRollIndex: number  = 0;
+  private lastRelease:   (DiscogsRelease & { thumbDataUri?: string }) | undefined;
 
   constructor(ctx: vscode.ExtensionContext) {
     this.ctx = ctx;
@@ -70,7 +74,9 @@ export class DiscogsThemeGeneratorPanel {
       case 'reset':          await this.resetTheme(); break;
       case 'openUrl':        vscode.env.openExternal(vscode.Uri.parse(msg.url)); break;
       case 'setScope':       this.setScope(msg.useWorkspace); break;
-      case 'setAutoRefresh': this.setAutoRefresh(msg.config); break;
+      case 'setAutoRefresh':   this.setAutoRefresh(msg.config); break;
+      case 'toggleDarkLight':  await this.toggleDarkLight(); break;
+      case 'rerollColors':     await this.rerollColors(); break;
     }
   }
 
@@ -124,6 +130,23 @@ export class DiscogsThemeGeneratorPanel {
     if (this.autoRefreshTimer) { clearTimeout(this.autoRefreshTimer); this.autoRefreshTimer = undefined; }
   }
 
+  // ─── Toggle dark/light & re-roll ─────────────────────────────────────────────
+
+  private async toggleDarkLight() {
+    if (!this.lastPalette) { return; }
+    this.lastIsDark    = !this.lastIsDark;
+    this.lastRollIndex = 0;
+    const theme = buildThemeFromVibrantPalette(this.lastPalette, { isDark: this.lastIsDark, rollIndex: 0 });
+    await this.applyTheme(theme, 'discogs', this.lastRelease);
+  }
+
+  private async rerollColors() {
+    if (!this.lastPalette) { return; }
+    this.lastRollIndex++;
+    const theme = buildThemeFromVibrantPalette(this.lastPalette, { isDark: this.lastIsDark, rollIndex: this.lastRollIndex });
+    await this.applyTheme(theme, 'discogs', this.lastRelease);
+  }
+
   // ─── Random theme ─────────────────────────────────────────────────────────────
 
   private async applyRandom() {
@@ -158,8 +181,12 @@ export class DiscogsThemeGeneratorPanel {
       this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
 
       this.post({ command: 'statusUpdate', message: 'Applying palette…' });
-      const theme = buildThemeFromVibrantPalette(palette);
-      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
     } catch (e: any) {
       this.post({ command: 'discogsError', message: e.message });
       vscode.window.showErrorMessage(`Discogs fetch failed: ${e.message}`);
@@ -191,8 +218,12 @@ export class DiscogsThemeGeneratorPanel {
       this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
 
       this.post({ command: 'statusUpdate', message: 'Applying palette…' });
-      const theme = buildThemeFromVibrantPalette(palette);
-      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
     } catch (e: any) {
       this.post({ command: 'discogsError', message: e.message });
       vscode.window.showErrorMessage(`Discogs search failed: ${e.message}`);
@@ -213,8 +244,12 @@ export class DiscogsThemeGeneratorPanel {
       }
 
       const palette = await extractVibrantPalette(buffer);
-      const theme = buildThemeFromVibrantPalette(palette);
-      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
 
       // Update the open panel's card if visible
       if (this.panel) {
@@ -632,6 +667,8 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     <div class="tmeta" id="tm"></div>
     <div class="erow hidden" id="er">
       <button class="bsm" id="bcp">📋 Copy JSON</button>
+      <button class="bsm hidden" id="btoggle">🌙 Dark Mode</button>
+      <button class="bsm hidden" id="breroll">🎲 Re-roll Colors</button>
     </div>
     <div class="dbg-wrap hidden" id="dbg-wrap">
       <div class="dbg-hd">
@@ -688,7 +725,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
   // ── refs ───────────────────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
-  const bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr');
+  const bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr'), btoggle=$('btoggle'), breroll=$('breroll');
   const sb=$('sb'), st=$('st');
   const tn=$('tn'), tm=$('tm'), er=$('er');
   const dcrd=$('dcrd'), dimg=$('dimg');
@@ -714,8 +751,10 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   }
   $('search-btn').onclick = doSearch;
   $('search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { doSearch(); } });
-  bcp.onclick  = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
-  bclr.onclick = () => vsc.postMessage({ command:'clearHistory' });
+  bcp.onclick     = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
+  btoggle.onclick = () => vsc.postMessage({ command:'toggleDarkLight' });
+  breroll.onclick = () => vsc.postMessage({ command:'rerollColors' });
+  bclr.onclick    = () => vsc.postMessage({ command:'clearHistory' });
   $('dlnk').onclick = () => { if (current?.discogs) vsc.postMessage({ command:'openUrl', url:current.discogs.uri }); };
   $('credits-link').onclick = (e) => { e.preventDefault(); vsc.postMessage({ command:'openUrl', url:'https://www.martinbarker.me' }); };
 
@@ -901,12 +940,18 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     tn.innerHTML = esc(e.name) + \` <span class="badge \${mc}">\${ml}</span>\` + sb2;
     tm.textContent = relT(e.timestamp);
     er.classList.remove('hidden');
+    const isDiscogs = e.source === 'discogs';
+    btoggle.classList.toggle('hidden', !isDiscogs);
+    breroll.classList.toggle('hidden', !isDiscogs);
+    if (isDiscogs) { btoggle.textContent = e.isDark ? '☀️ Light Mode' : '🌙 Dark Mode'; }
   }
 
   function clearCurrent() {
     tn.textContent = '— No theme generated yet —';
     tm.textContent = '';
     er.classList.add('hidden');
+    btoggle.classList.add('hidden');
+    breroll.classList.add('hidden');
     dbgWrap.classList.add('hidden');
   }
 
