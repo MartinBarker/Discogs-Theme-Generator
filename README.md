@@ -1,5 +1,7 @@
 # Discogs Theme Generator
 
+<p align="center"><img src="images/icon.png" alt="Discogs Theme Generator" width="128"/></p>
+
 Generate color themes from Discogs album art. Pick a random vinyl release, extract colors from its cover, and apply the palette to your editor.
 
 Works in **VS Code**, **Cursor**, and any editor that supports VS Code extensions.
@@ -34,13 +36,58 @@ To create an installable `.vsix` file:
 npm install -g @vscode/vsce
 ```
 
-**2. Package the extension:**
+**2. Build a new version and package:**
+
+Bump the version in `package.json`, then run:
 
 ```bash
+npm run bundle
 vsce package
 ```
 
-This produces a file like `discogs-theme-generator-0.0.1.vsix` in the project root.
+Or use `npm version` to bump and tag in one step:
+
+```bash
+npm version patch   # 0.0.5 → 0.0.6
+npm run bundle
+vsce package
+```
+
+Use `patch` (bug fixes), `minor` (new features), or `major` (breaking changes). This produces a file like `discogs-theme-generator-0.0.6.vsix` in the project root.
+
+---
+
+## Publish to VS Code Marketplace
+
+To build and publish the extension to the [VS Code Marketplace](https://marketplace.visualstudio.com/):
+
+**1. Get a Personal Access Token (PAT):**
+
+- Go to [Azure DevOps](https://dev.azure.com) → your organization → **User settings** (top right) → **Personal access tokens**
+- Create a new token with **Marketplace (Publish)** scope (or **Full access**)
+- Copy the token (it is shown only once)
+
+**2. Bump version, build, and publish:**
+
+```bash
+npm version patch
+npm run bundle
+vsce publish --pat YOUR_AZURE_PERSONAL_ACCESS_TOKEN
+```
+
+Or set the token in the environment (recommended so it’s not in shell history):
+
+```bash
+# Windows (PowerShell)
+$env:VSCE_PAT = "YOUR_AZURE_PERSONAL_ACCESS_TOKEN"
+vsce publish
+
+# Windows (cmd)
+set VSCE_PAT=YOUR_AZURE_PERSONAL_ACCESS_TOKEN
+vsce publish
+```
+
+`vsce publish` runs the prepublish script (which runs `bundle`), then packages and uploads the extension. The first time you publish, you may need to log in or confirm the publisher.
 
 ---
 

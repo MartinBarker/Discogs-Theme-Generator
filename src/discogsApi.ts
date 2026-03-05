@@ -104,7 +104,7 @@ export async function extractVibrantPalette(buffer: Buffer): Promise<VibrantPale
   };
 }
 
-// ─── Fetch a random release ───────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function cleanArtist(name: string): string {
   return name.replace(/\s*\(\d+\)\s*$/, '').trim();
@@ -115,6 +115,84 @@ function extractYouTubeId(uri: string): string | undefined {
   return m?.[1];
 }
 
+function parseReleaseData(id: number, data: any): DiscogsRelease | null {
+  if (!data.images?.length) { return null; }
+  const primary = data.images.find((i: any) => i.type === 'primary') ?? data.images[0];
+  if (!primary?.uri) { return null; }
+
+  const artists = (data.artists ?? [])
+    .map((a: any) => cleanArtist(a.name))
+    .join(', ') || 'Unknown Artist';
+
+  const tracklist = (data.tracklist ?? [])
+    .filter((t: any) => t.type_ === 'track' && t.title)
+    .slice(0, 8)
+    .map((t: any) => t.title as string);
+
+  const formats = (data.formats ?? []) as any[];
+  const format = formats.length > 0
+    ? formats.slice(0, 2).map((f: any) => {
+        const desc = (f.descriptions ?? []).join(', ');
+        return desc ? `${f.name} (${desc})` : (f.name as string);
+      }).join(', ')
+    : undefined;
+
+  const labels = (data.labels ?? []) as any[];
+  const label = labels.length > 0 ? (labels[0].name as string) : undefined;
+
+  let videoId: string | undefined;
+  for (const v of (data.videos ?? []) as any[]) {
+    videoId = extractYouTubeId(v.uri ?? '');
+    if (videoId) { break; }
+  }
+
+  return {
+    id,
+    title:     data.title  ?? 'Unknown Title',
+    artists,
+    year:      data.year   ?? 0,
+    imageUrl:  primary.uri,
+    thumb:     primary.uri150 ?? primary.uri,
+    uri:       data.uri    ?? `https://www.discogs.com/release/${id}`,
+    genres:    data.genres ?? [],
+    styles:    data.styles ?? [],
+    country:   data.country,
+    tracklist,
+    format,
+    label,
+    videoId,
+  };
+}
+
+// ─── Fetch a specific release by ID ──────────────────────────────────────────
+
+export async function fetchReleaseById(id: number): Promise<DiscogsRelease> {
+  const json = await getText(`https://api.discogs.com/releases/${id}`);
+  const data = JSON.parse(json);
+  const release = parseReleaseData(id, data);
+  if (!release) { throw new Error(`Release #${id} has no usable images`); }
+  return release;
+}
+
+// ─── Search Discogs and fetch the best matching release ───────────────────────
+
+export async function searchAndFetchRelease(query: string): Promise<DiscogsRelease> {
+  const url = `https://api.discogs.com/database/search?q=${encodeURIComponent(query)}&type=release&per_page=5`;
+  const json = await getText(url);
+  const data = JSON.parse(json);
+  if (!data.results?.length) {
+    throw new Error(`No Discogs results found for "${query}"`);
+  }
+  for (const result of (data.results as any[]).slice(0, 5)) {
+    if (result.id) {
+      try { return await fetchReleaseById(result.id as number); } catch { continue; }
+    }
+  }
+  throw new Error(`No usable releases found for "${query}"`);
+}
+
+// ─── Fetch a random release ───────────────────────────────────────────────────
+
 export async function fetchRandomRelease(maxAttempts = 10): Promise<DiscogsRelease> {
   const errors: string[] = [];
 
@@ -122,58 +200,9 @@ export async function fetchRandomRelease(maxAttempts = 10): Promise<DiscogsRelea
     const id = Math.floor(Math.random() * 7_900_000) + 100_000;
     try {
       const json = await getText(`https://api.discogs.com/releases/${id}`);
-      const data = JSON.parse(json);
-
-      if (!data.images?.length) { errors.push(`#${id}: no images`); continue; }
-
-      const primary = data.images.find((i: any) => i.type === 'primary') ?? data.images[0];
-      if (!primary?.uri) { errors.push(`#${id}: missing uri`); continue; }
-
-      const artists = (data.artists ?? [])
-        .map((a: any) => cleanArtist(a.name))
-        .join(', ') || 'Unknown Artist';
-
-      const tracklist = (data.tracklist ?? [])
-        .filter((t: any) => t.type_ === 'track' && t.title)
-        .slice(0, 8)
-        .map((t: any) => t.title as string);
-
-      // Format: combine name + descriptions, up to 2 formats
-      const formats = (data.formats ?? []) as any[];
-      const format = formats.length > 0
-        ? formats.slice(0, 2).map((f: any) => {
-            const desc = (f.descriptions ?? []).join(', ');
-            return desc ? `${f.name} (${desc})` : (f.name as string);
-          }).join(', ')
-        : undefined;
-
-      // Label: first label name
-      const labels = (data.labels ?? []) as any[];
-      const label = labels.length > 0 ? (labels[0].name as string) : undefined;
-
-      // YouTube video ID: first video that is a YouTube link
-      let videoId: string | undefined;
-      for (const v of (data.videos ?? []) as any[]) {
-        videoId = extractYouTubeId(v.uri ?? '');
-        if (videoId) { break; }
-      }
-
-      return {
-        id,
-        title:     data.title     ?? 'Unknown Title',
-        artists,
-        year:      data.year      ?? 0,
-        imageUrl:  primary.uri,
-        thumb:     primary.uri150 ?? primary.uri,
-        uri:       data.uri       ?? `https://www.discogs.com/release/${id}`,
-        genres:    data.genres    ?? [],
-        styles:    data.styles    ?? [],
-        country:   data.country,
-        tracklist,
-        format,
-        label,
-        videoId,
-      };
+      const release = parseReleaseData(id, JSON.parse(json));
+      if (!release) { errors.push(`#${id}: no images`); continue; }
+      return release;
     } catch (e: any) {
       errors.push(`#${id}: ${e.message}`);
     }
