@@ -1,6 +1,4 @@
-# Discogs Theme Generator
-
-<p align="center"><img src="images/icon.png" alt="Discogs Theme Generator" width="128"/></p>
+<p align="center"><img src="images/banner.png" alt="Discogs Color Theme Generator" width="100%"/></p>
 
 Generate color themes from Discogs album art. Pick a random vinyl release, extract colors from its cover, and apply the palette to your editor.
 
@@ -12,13 +10,13 @@ Works in **VS Code**, **Cursor**, and any editor that supports VS Code extension
 
 1. Install the extension (from VSIX or marketplace)
 2. `Ctrl+Shift+P` (or `Cmd+Shift+P` on Mac) → **Open Discogs Theme Generator**
-3. Click **From Discogs** — a random release is fetched and its colors become your theme
+3. Click **Randomly Refresh Discogs Theme** — a random release is fetched and its colors become your theme
 
 ---
 
 ## Features
 
-- **From Discogs** — fetches random vinyl releases and builds themes from album art
+- **Randomly Refresh Discogs Theme** — fetches random vinyl releases and builds themes from album art
 - **Generate Random** — random color palettes without Discogs
 - **History** — browse and reload past themes
 - **Auto-refresh** — optional interval or on workspace open

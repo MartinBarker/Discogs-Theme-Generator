@@ -39,6 +39,9 @@ export class DiscogsThemeGeneratorPanel {
     setTimeout(() => {
       this.sendHistory();
       this.post({ command: 'stateSync', scope: this.getScopeLabel(), autoRefresh: this.getAutoRefreshConfig() });
+      if (getHistory(this.ctx).length === 0) {
+        setTimeout(() => this.startDiscogsFlow(), 400);
+      }
     }, 300);
   }
 
@@ -380,7 +383,12 @@ body {
 .hdr-text { display:flex; flex-direction:column; }
 h1 { font-size:1.35em; font-weight:700; line-height:1.2; }
 .version { font-size:.68em; color:var(--vscode-descriptionForeground); }
+.credits-link { color:var(--vscode-descriptionForeground); text-decoration:none; }
+.credits-link:hover { text-decoration:underline; color:var(--vscode-foreground); }
 .sub { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:16px; padding-left:42px; }
+/* ── primary action ── */
+.primary-action { margin-bottom:18px; }
+.hint { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:6px; }
 /* ── search ── */
 .search-row { display:flex; gap:6px; margin-bottom:14px; }
 .search-row input {
@@ -394,7 +402,7 @@ h1 { font-size:1.35em; font-weight:700; line-height:1.2; }
 .search-row input::placeholder { color:var(--vscode-input-placeholderForeground,rgba(255,255,255,.3)); }
 /* ── scope toggle ── */
 .scope-lbl-row { margin-bottom:6px; }
-.scope-row { display:flex; gap:8px; margin-bottom:14px; }
+.scope-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:14px; }
 .scope-btn.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
 /* ── buttons ── */
 .actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
@@ -438,15 +446,14 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 @keyframes spin { to { transform:rotate(360deg); } }
 /* ── sections ── */
 .sec { margin-bottom:20px; }
+.theme-discogs-row { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:20px; }
+.theme-discogs-row .sec { flex:1 1 260px; min-width:0; margin-bottom:0; display:flex; flex-direction:column; }
+.theme-discogs-row .sec > .card { flex:1; }
+#dsec.hidden + .sec { flex:1 1 100%; }
 .sec-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
 .lbl { font-size:.68em; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--vscode-descriptionForeground); }
 /* ── card ── */
 .card { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:15px; }
-/* ── swatches ── */
-.swatches { display:flex; gap:6px; margin-bottom:11px; }
-.sw { width:28px; height:28px; border-radius:50%; border:2px solid rgba(255,255,255,.14); transition:transform .18s; }
-.sw:hover { transform:scale(1.18); }
-.swatches.empty .sw { background:var(--vscode-widget-border,rgba(255,255,255,.1)); }
 /* ── theme name ── */
 .tname { font-size:1.08em; font-weight:600; margin-bottom:3px; }
 .tmeta { font-size:.76em; color:var(--vscode-descriptionForeground); margin-bottom:11px; }
@@ -457,19 +464,20 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 .erow { display:flex; flex-wrap:wrap; gap:6px; }
 .erow.hidden { display:none; }
 /* ── discogs card ── */
-.dcrd { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:13px; }
+.dcrd { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:13px; overflow:hidden; }
 .dcrd.hidden { display:none; }
+#dsec.hidden { display:none; }
 .dcrd-top { display:flex; gap:14px; align-items:flex-start; margin-bottom:12px; }
 .dart { width:180px; height:180px; object-fit:cover; border-radius:5px; flex-shrink:0; background:var(--vscode-widget-border,rgba(255,255,255,.08)); }
 .dinf { flex:1; min-width:0; }
 .dart-nm { font-size:.8em; color:var(--vscode-descriptionForeground); margin-bottom:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dtitle { font-size:1em; font-weight:700; margin-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dyear  { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:4px; }
-.dmeta2 { font-size:.75em; color:var(--vscode-descriptionForeground); margin-bottom:5px; display:flex; flex-wrap:wrap; gap:4px 10px; }
-.dmeta2 span { white-space:nowrap; }
+.dyear  { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dmeta2 { font-size:.75em; color:var(--vscode-descriptionForeground); margin-bottom:5px; display:flex; flex-wrap:wrap; gap:4px 10px; overflow:hidden; }
+.dmeta2 span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
 .dtags  { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:7px; }
 .tag    { font-size:.68em; padding:2px 6px; border-radius:999px; background:rgba(255,255,255,.08); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); }
-.dtracks { font-size:.73em; color:var(--vscode-descriptionForeground); margin-bottom:7px; line-height:1.6; }
+.dtracks { font-size:.73em; color:var(--vscode-descriptionForeground); margin-bottom:7px; line-height:1.6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 /* ── album art lightbox ── */
 .dart { cursor:zoom-in; }
 .lightbox {
@@ -486,17 +494,16 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   display:flex; align-items:center; justify-content:center;
 }
 .lb-close:hover { background:rgba(255,255,255,.25); }
-/* ── YouTube link ── */
-.yt-wrap { margin-top:8px; }
+/* ── Discogs/YouTube links ── */
+.discogs-links { display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
 .yt-wrap.hidden { display:none; }
 .yt-open { font-size:.76em; color:var(--vscode-textLink-foreground,#74b9ff); background:none; border:none; padding:0; cursor:pointer; text-decoration:underline; }
 .yt-open:hover { filter:brightness(1.2); }
 
-/* ── Vibrant debug ── */
+/* ── Vibrant debug (inside Current Theme) ── */
 .dbg-wrap { margin-top:12px; padding-top:10px; border-top:1px solid var(--vscode-widget-border,rgba(255,255,255,.08)); }
 .dbg-wrap.hidden { display:none; }
 .dbg-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
-.dbg-url { font-size:.68em; color:var(--vscode-descriptionForeground); word-break:break-all; margin-bottom:8px; font-family:monospace; }
 .dbg-swatches { display:flex; flex-wrap:wrap; gap:6px; }
 .dbg-sw { display:flex; flex-direction:column; align-items:center; gap:3px; }
 .dbg-dot { width:24px; height:24px; border-radius:50%; border:2px solid rgba(255,255,255,.15); }
@@ -546,18 +553,33 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   <img class="hdr-icon" src="${iconUri}" alt="Discogs Theme Generator icon">
   <div class="hdr-text">
     <h1>Discogs Theme Generator</h1>
-    <span class="version">v${version}</span>
+    <span class="version">v${version} · <a href="#" id="credits-link" class="credits-link">created by martin barker</a></span>
   </div>
 </div>
 <p class="sub">Generate themes from real Discogs album art.</p>
 
+<!-- Primary action -->
+<div class="primary-action">
+  <div class="hint">click to set color theme</div>
+  <button class="bdiscogs" id="bd">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+      <circle cx="12" cy="12" r="10"/>
+      <circle cx="12" cy="12" r="4.5"/>
+      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
+      <line x1="12" y1="7.5" x2="12" y2="2"/>
+    </svg>
+    Randomly Refresh Discogs Theme
+  </button>
+</div>
+
 <!-- Search row -->
+<div class="hint">or search for specific release:</div>
 <div class="search-row">
   <input type="text" id="search-input" placeholder="Release ID or search (e.g. Pink Floyd Wish You Were Here)">
   <button class="bp" id="search-btn">Search</button>
 </div>
 
-<!-- Scope toggle -->
+<!-- Scope toggle + Reset -->
 <div class="scope-lbl-row"><span class="lbl">Apply to</span></div>
 <div class="scope-row">
   <button class="bs scope-btn active" id="scope-ws" title="Apply theme only to this window">
@@ -568,20 +590,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="6" y="7" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
     All windows
   </button>
-</div>
-
-<!-- Actions -->
-<div class="actions">
-  <button class="bdiscogs" id="bd">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
-      <circle cx="12" cy="12" r="10"/>
-      <circle cx="12" cy="12" r="4.5"/>
-      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
-      <line x1="12" y1="7.5" x2="12" y2="2"/>
-    </svg>
-    From Discogs
-  </button>
-  <button class="bs" id="br" disabled>
+  <button class="bs" id="br" disabled style="margin-left:auto">
     <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg>
     Reset
   </button>
@@ -589,24 +598,10 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
 <div class="sbar hidden" id="sb"><div class="spin"></div><span id="st"></span></div>
 
-<!-- Current theme -->
-<div class="sec">
-  <div class="sec-hd"><span class="lbl">Current Theme</span></div>
-  <div class="card">
-    <div class="swatches empty" id="sws">
-      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
-      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
-    </div>
-    <div class="tname" id="tn">— No theme generated yet —</div>
-    <div class="tmeta" id="tm"></div>
-    <div class="erow hidden" id="er">
-      <button class="bsm" id="bcp">📋 Copy JSON</button>
-    </div>
-  </div>
-</div>
-
-<!-- Discogs release card -->
-<div class="sec" id="dsec">
+<!-- Discogs release + Current theme (side by side when space allows) -->
+<div class="theme-discogs-row">
+<!-- Discogs release card (hidden until release loaded) -->
+<div class="sec hidden" id="dsec">
   <div class="sec-hd"><span class="lbl">Discogs Release</span></div>
   <div class="dcrd hidden" id="dcrd">
     <div class="dcrd-top">
@@ -618,23 +613,35 @@ button:disabled { opacity:.35; cursor:not-allowed; }
         <div class="dmeta2"  id="dmeta2"></div>
         <div class="dtags"   id="dtgs"></div>
         <div class="dtracks" id="dtks"></div>
-        <button class="blink" id="dlnk">View on Discogs ↗</button>
+        <div class="discogs-links">
+          <button class="blink" id="dlnk">View on Discogs ↗</button>
+          <div class="yt-wrap hidden" id="yt-wrap">
+            <button class="yt-open" id="yt-ext">▶ Watch on YouTube ↗</button>
+          </div>
+        </div>
       </div>
     </div>
-    <!-- YouTube link -->
-    <div class="yt-wrap hidden" id="yt-wrap">
-      <button class="yt-open" id="yt-ext">▶ Open in YouTube ↗</button>
+  </div>
+</div>
+
+<!-- Current theme -->
+<div class="sec">
+  <div class="sec-hd"><span class="lbl">Current Theme</span></div>
+  <div class="card">
+    <div class="tname" id="tn">— No theme generated yet —</div>
+    <div class="tmeta" id="tm"></div>
+    <div class="erow hidden" id="er">
+      <button class="bsm" id="bcp">📋 Copy JSON</button>
     </div>
-    <!-- Vibrant debug info -->
     <div class="dbg-wrap hidden" id="dbg-wrap">
       <div class="dbg-hd">
         <span class="lbl" style="font-size:.62em">Vibrant Extraction</span>
         <button class="blink" style="font-size:.72em" id="dbg-hide">Hide</button>
       </div>
-      <div class="dbg-url" id="dbg-url"></div>
       <div class="dbg-swatches" id="dbg-swatches"></div>
     </div>
   </div>
+</div>
 </div>
 
 <!-- History -->
@@ -683,14 +690,14 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   const $ = (id) => document.getElementById(id);
   const bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr');
   const sb=$('sb'), st=$('st');
-  const sws=$('sws'), tn=$('tn'), tm=$('tm'), er=$('er');
+  const tn=$('tn'), tm=$('tm'), er=$('er');
   const dcrd=$('dcrd'), dimg=$('dimg');
   const hlist=$('hlist');
   const scopeWs=$('scope-ws'), scopeGl=$('scope-gl');
   const ytWrap=$('yt-wrap');
   const arHoursWrap=$('ar-intv'), arHoursInput=$('ar-hours'), arMinsInput=$('ar-mins'), arHint=$('ar-hint');
   const lightbox=$('lightbox'), lbImg=$('lb-img');
-  const dbgWrap=$('dbg-wrap'), dbgUrl=$('dbg-url'), dbgSwatches=$('dbg-swatches');
+  const dbgWrap=$('dbg-wrap'), dbgSwatches=$('dbg-swatches');
 
   // current YouTube video ID
   let currentVideoId = null;
@@ -710,6 +717,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   bcp.onclick  = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
   bclr.onclick = () => vsc.postMessage({ command:'clearHistory' });
   $('dlnk').onclick = () => { if (current?.discogs) vsc.postMessage({ command:'openUrl', url:current.discogs.uri }); };
+  $('credits-link').onclick = (e) => { e.preventDefault(); vsc.postMessage({ command:'openUrl', url:'https://www.martinbarker.me' }); };
 
   // ── lightbox ───────────────────────────────────────────────────────────────
   dimg.onclick = () => {
@@ -843,8 +851,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
         break;
 
       case 'vibrantDebug': {
-        const { imageUrl, palette } = msg;
-        dbgUrl.textContent = 'Image URL: ' + imageUrl;
+        const { palette } = msg;
         dbgSwatches.innerHTML = '';
         const swatchOrder = [
           ['Vibrant',      palette.vibrant],
@@ -888,8 +895,6 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
   // ── current theme card ─────────────────────────────────────────────────────
   function renderCurrent(e) {
-    sws.classList.remove('empty');
-    sws.querySelectorAll('.sw').forEach((d,i) => { if (e.swatches[i]) d.style.background = e.swatches[i]; });
     const mc = e.isDark ? 'bd' : 'bl';
     const ml = e.isDark ? 'Dark' : 'Light';
     const sb2 = e.source==='discogs' ? ' <span class="badge bdisc">Discogs</span>' : '';
@@ -899,15 +904,15 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   }
 
   function clearCurrent() {
-    sws.classList.add('empty');
-    sws.querySelectorAll('.sw').forEach(s => s.style.background='');
     tn.textContent = '— No theme generated yet —';
     tm.textContent = '';
     er.classList.add('hidden');
+    dbgWrap.classList.add('hidden');
   }
 
   // ── discogs card ────────────────────────────────────────────────────────────
   function renderDiscogsCard(rel, imgSrc) {
+    $('dsec').classList.remove('hidden');
     dcrd.classList.remove('hidden');
     dimg.src = imgSrc || '';
     $('dart').textContent  = rel.artists || '';
@@ -945,6 +950,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   }
 
   function hideDiscogs() {
+    $('dsec').classList.add('hidden');
     dcrd.classList.add('hidden');
     ytWrap.classList.add('hidden');
     currentVideoId = null;
