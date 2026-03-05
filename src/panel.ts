@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { generateColorTheme, buildThemeFromVibrantPalette, ColorTokens, GeneratedTheme } from './colorTheme';
-import { fetchRandomRelease, fetchImageBuffer, fetchImageDataUri, extractVibrantPalette, DiscogsRelease } from './discogsApi';
+import { generateColorTheme, buildThemeFromVibrantPalette, ColorTokens, GeneratedTheme, VibrantPaletteColors } from './colorTheme';
+import { fetchRandomRelease, fetchReleaseById, searchAndFetchRelease, fetchImageBuffer, fetchImageDataUri, extractVibrantPalette, DiscogsRelease } from './discogsApi';
 import {
   getHistory, pushHistory, deleteEntry, clearHistory,
   toSummary, discogsFromRelease, HistoryEntry,
@@ -13,12 +13,17 @@ const AR_KEY    = 'discogsThemeGenerator.autoRefresh';    // AutoRefreshConfig
 interface AutoRefreshConfig {
   mode: 'off' | 'onOpen' | 'interval';
   intervalHours: number;
+  intervalMinutes?: number;
 }
 
 export class DiscogsThemeGeneratorPanel {
   private panel: vscode.WebviewPanel | undefined;
   private readonly ctx: vscode.ExtensionContext;
   private autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastPalette:   VibrantPaletteColors | undefined;
+  private lastIsDark:    boolean = false;
+  private lastRollIndex: number  = 0;
+  private lastRelease:   (DiscogsRelease & { thumbDataUri?: string }) | undefined;
 
   constructor(ctx: vscode.ExtensionContext) {
     this.ctx = ctx;
@@ -31,12 +36,16 @@ export class DiscogsThemeGeneratorPanel {
       'discogsThemeGenerator', 'Discogs Theme Generator', vscode.ViewColumn.One,
       { enableScripts: true, retainContextWhenHidden: true },
     );
+    this.panel.iconPath = vscode.Uri.joinPath(this.ctx.extensionUri, 'images', 'icon.png');
     this.panel.webview.html = this.buildHtml();
     this.panel.webview.onDidReceiveMessage((m) => this.handleMessage(m));
     this.panel.onDidDispose(() => { this.panel = undefined; });
     setTimeout(() => {
       this.sendHistory();
       this.post({ command: 'stateSync', scope: this.getScopeLabel(), autoRefresh: this.getAutoRefreshConfig() });
+      if (getHistory(this.ctx).length === 0) {
+        setTimeout(() => this.startDiscogsFlow(), 400);
+      }
     }, 300);
   }
 
@@ -55,8 +64,9 @@ export class DiscogsThemeGeneratorPanel {
 
   private async handleMessage(msg: any) {
     switch (msg.command) {
-      case 'generate':       await this.applyRandom(); break;
-      case 'fromDiscogs':    await this.startDiscogsFlow(); break;
+      case 'generate':         await this.applyRandom(); break;
+      case 'fromDiscogs':      await this.startDiscogsFlow(); break;
+      case 'fromDiscogsSearch': await this.startDiscogsSearchFlow(msg.query); break;
       case 'loadEntry':      await this.loadHistoryEntry(msg.id); break;
       case 'deleteEntry':    await this.deleteHistoryEntry(msg.id); break;
       case 'copyJson':       await this.copyJson(msg.id ?? null, msg.tokens ?? null, msg.name ?? ''); break;
@@ -64,7 +74,9 @@ export class DiscogsThemeGeneratorPanel {
       case 'reset':          await this.resetTheme(); break;
       case 'openUrl':        vscode.env.openExternal(vscode.Uri.parse(msg.url)); break;
       case 'setScope':       this.setScope(msg.useWorkspace); break;
-      case 'setAutoRefresh': this.setAutoRefresh(msg.config); break;
+      case 'setAutoRefresh':   this.setAutoRefresh(msg.config); break;
+      case 'toggleDarkLight':  await this.toggleDarkLight(); break;
+      case 'rerollColors':     await this.rerollColors(); break;
     }
   }
 
@@ -92,7 +104,7 @@ export class DiscogsThemeGeneratorPanel {
   // ─── Auto-refresh helpers ─────────────────────────────────────────────────────
 
   private getAutoRefreshConfig(): AutoRefreshConfig {
-    return this.ctx.globalState.get<AutoRefreshConfig>(AR_KEY, { mode: 'off', intervalHours: 2 });
+    return this.ctx.globalState.get<AutoRefreshConfig>(AR_KEY, { mode: 'off', intervalHours: 2, intervalMinutes: 0 });
   }
 
   private setAutoRefresh(config: AutoRefreshConfig) {
@@ -105,7 +117,8 @@ export class DiscogsThemeGeneratorPanel {
     this.clearTimer();
     const cfg = this.getAutoRefreshConfig();
     if (cfg.mode !== 'interval') { return; }
-    const ms = Math.max(cfg.intervalHours, 1) * 60 * 60 * 1000;
+    const totalMins = Math.max(5, (cfg.intervalHours ?? 2) * 60 + (cfg.intervalMinutes ?? 0));
+    const ms = totalMins * 60 * 1000;
     const tick = async () => {
       await this.applyDiscogsThemeSilently();
       this.autoRefreshTimer = setTimeout(tick, ms);
@@ -115,6 +128,23 @@ export class DiscogsThemeGeneratorPanel {
 
   private clearTimer() {
     if (this.autoRefreshTimer) { clearTimeout(this.autoRefreshTimer); this.autoRefreshTimer = undefined; }
+  }
+
+  // ─── Toggle dark/light & re-roll ─────────────────────────────────────────────
+
+  private async toggleDarkLight() {
+    if (!this.lastPalette) { return; }
+    this.lastIsDark    = !this.lastIsDark;
+    this.lastRollIndex = 0;
+    const theme = buildThemeFromVibrantPalette(this.lastPalette, { isDark: this.lastIsDark, rollIndex: 0 });
+    await this.applyTheme(theme, 'discogs', this.lastRelease);
+  }
+
+  private async rerollColors() {
+    if (!this.lastPalette) { return; }
+    this.lastRollIndex++;
+    const theme = buildThemeFromVibrantPalette(this.lastPalette, { isDark: this.lastIsDark, rollIndex: this.lastRollIndex });
+    await this.applyTheme(theme, 'discogs', this.lastRelease);
   }
 
   // ─── Random theme ─────────────────────────────────────────────────────────────
@@ -151,11 +181,52 @@ export class DiscogsThemeGeneratorPanel {
       this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
 
       this.post({ command: 'statusUpdate', message: 'Applying palette…' });
-      const theme = buildThemeFromVibrantPalette(palette);
-      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
     } catch (e: any) {
       this.post({ command: 'discogsError', message: e.message });
       vscode.window.showErrorMessage(`Discogs fetch failed: ${e.message}`);
+    }
+  }
+
+  private async startDiscogsSearchFlow(query: string) {
+    const trimmed = query.trim();
+    if (!trimmed) { return; }
+    this.post({ command: 'statusUpdate', message: /^\d+$/.test(trimmed) ? `Fetching release #${trimmed}…` : `Searching Discogs for "${trimmed}"…` });
+    try {
+      const release = /^\d+$/.test(trimmed)
+        ? await fetchReleaseById(parseInt(trimmed, 10))
+        : await searchAndFetchRelease(trimmed);
+
+      this.post({ command: 'statusUpdate', message: 'Fetching album art…' });
+      const { buffer, contentType } = await fetchImageBuffer(release.imageUrl);
+      const imageDataUri = `data:${contentType};base64,${buffer.toString('base64')}`;
+
+      let thumbDataUri = imageDataUri;
+      if (release.thumb && release.thumb !== release.imageUrl) {
+        try { thumbDataUri = await fetchImageDataUri(release.thumb); } catch { /* fall back */ }
+      }
+
+      this.post({ command: 'discogsImageReady', release, imageDataUri, thumbDataUri });
+
+      this.post({ command: 'statusUpdate', message: 'Extracting colours with Vibrant…' });
+      const palette = await extractVibrantPalette(buffer);
+      this.post({ command: 'vibrantDebug', imageUrl: release.imageUrl, palette });
+
+      this.post({ command: 'statusUpdate', message: 'Applying palette…' });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
+    } catch (e: any) {
+      this.post({ command: 'discogsError', message: e.message });
+      vscode.window.showErrorMessage(`Discogs search failed: ${e.message}`);
     }
   }
 
@@ -173,8 +244,12 @@ export class DiscogsThemeGeneratorPanel {
       }
 
       const palette = await extractVibrantPalette(buffer);
-      const theme = buildThemeFromVibrantPalette(palette);
-      await this.applyTheme(theme, 'discogs', { ...release, thumbDataUri });
+      this.lastPalette   = palette;
+      this.lastIsDark    = false;
+      this.lastRollIndex = 0;
+      this.lastRelease   = { ...release, thumbDataUri };
+      const theme = buildThemeFromVibrantPalette(palette, { isDark: false, rollIndex: 0 });
+      await this.applyTheme(theme, 'discogs', this.lastRelease);
 
       // Update the open panel's card if visible
       if (this.panel) {
@@ -313,6 +388,11 @@ export class DiscogsThemeGeneratorPanel {
     const nonce = Array.from({ length: 32 }, () =>
       'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 62)]
     ).join('');
+    const iconUri = this.panel!.webview.asWebviewUri(
+      vscode.Uri.joinPath(this.ctx.extensionUri, 'images', 'icon.png')
+    );
+    const cspSource = this.panel!.webview.cspSource;
+    const version: string = this.ctx.extension.packageJSON.version ?? '';
 
     return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -320,7 +400,7 @@ export class DiscogsThemeGeneratorPanel {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <meta http-equiv="Content-Security-Policy"
-  content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; frame-src https://www.youtube-nocookie.com;">
+  content="default-src 'none'; img-src data: blob: ${cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'">
 <title>Discogs Theme Generator</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -334,20 +414,31 @@ body {
 }
 /* ── header ── */
 .hdr { display:flex; align-items:center; gap:10px; margin-bottom:4px; }
-h1 { font-size:1.35em; font-weight:700; }
+.hdr-icon { width:32px; height:32px; flex-shrink:0; }
+.hdr-text { display:flex; flex-direction:column; }
+h1 { font-size:1.35em; font-weight:700; line-height:1.2; }
+.version { font-size:.68em; color:var(--vscode-descriptionForeground); }
+.credits-link { color:var(--vscode-descriptionForeground); text-decoration:none; }
+.credits-link:hover { text-decoration:underline; color:var(--vscode-foreground); }
 .sub { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:16px; padding-left:42px; }
-/* ── scope toggle ── */
-.scope-row { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
-.scope-lbl { font-size:.72em; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:var(--vscode-descriptionForeground); white-space:nowrap; }
-.seg { display:flex; border-radius:6px; overflow:hidden; border:1px solid var(--vscode-widget-border,rgba(255,255,255,.15)); }
-.seg-btn {
-  flex:1; border:none; background:transparent; color:var(--vscode-descriptionForeground);
-  font:inherit; font-size:.78em; padding:5px 12px; cursor:pointer;
-  display:flex; align-items:center; gap:5px; transition:background .12s,color .12s;
+/* ── primary action ── */
+.primary-action { margin-bottom:18px; }
+.hint { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:6px; }
+/* ── search ── */
+.search-row { display:flex; gap:6px; margin-bottom:14px; }
+.search-row input {
+  flex:1; padding:7px 10px; font:inherit; font-size:.84em;
+  background:var(--vscode-input-background,rgba(0,0,0,.3));
+  color:var(--vscode-input-foreground,var(--vscode-foreground));
+  border:1px solid var(--vscode-input-border,rgba(255,255,255,.2));
+  border-radius:5px; outline:none;
 }
-.seg-btn + .seg-btn { border-left:1px solid var(--vscode-widget-border,rgba(255,255,255,.15)); }
-.seg-btn.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); }
-.seg-btn:hover:not(.active) { background:var(--vscode-list-hoverBackground,rgba(255,255,255,.06)); }
+.search-row input:focus { border-color:var(--vscode-focusBorder,#007fd4); }
+.search-row input::placeholder { color:var(--vscode-input-placeholderForeground,rgba(255,255,255,.3)); }
+/* ── scope toggle ── */
+.scope-lbl-row { margin-bottom:6px; }
+.scope-row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:14px; }
+.scope-btn.active { background:var(--vscode-button-background); color:var(--vscode-button-foreground); border-color:transparent; }
 /* ── buttons ── */
 .actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
 button {
@@ -390,15 +481,14 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 @keyframes spin { to { transform:rotate(360deg); } }
 /* ── sections ── */
 .sec { margin-bottom:20px; }
+.theme-discogs-row { display:flex; gap:16px; flex-wrap:wrap; margin-bottom:20px; }
+.theme-discogs-row .sec { flex:1 1 260px; min-width:0; margin-bottom:0; display:flex; flex-direction:column; }
+.theme-discogs-row .sec > .card { flex:1; }
+#dsec.hidden + .sec { flex:1 1 100%; }
 .sec-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
 .lbl { font-size:.68em; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--vscode-descriptionForeground); }
 /* ── card ── */
 .card { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:15px; }
-/* ── swatches ── */
-.swatches { display:flex; gap:6px; margin-bottom:11px; }
-.sw { width:28px; height:28px; border-radius:50%; border:2px solid rgba(255,255,255,.14); transition:transform .18s; }
-.sw:hover { transform:scale(1.18); }
-.swatches.empty .sw { background:var(--vscode-widget-border,rgba(255,255,255,.1)); }
 /* ── theme name ── */
 .tname { font-size:1.08em; font-weight:600; margin-bottom:3px; }
 .tmeta { font-size:.76em; color:var(--vscode-descriptionForeground); margin-bottom:11px; }
@@ -409,19 +499,20 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 .erow { display:flex; flex-wrap:wrap; gap:6px; }
 .erow.hidden { display:none; }
 /* ── discogs card ── */
-.dcrd { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:13px; }
+.dcrd { background:var(--vscode-editor-inactiveSelectionBackground,rgba(255,255,255,.04)); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); border-radius:6px; padding:13px; overflow:hidden; }
 .dcrd.hidden { display:none; }
+#dsec.hidden { display:none; }
 .dcrd-top { display:flex; gap:14px; align-items:flex-start; margin-bottom:12px; }
-.dart { width:120px; height:120px; object-fit:cover; border-radius:5px; flex-shrink:0; background:var(--vscode-widget-border,rgba(255,255,255,.08)); }
+.dart { width:180px; height:180px; object-fit:cover; border-radius:5px; flex-shrink:0; background:var(--vscode-widget-border,rgba(255,255,255,.08)); }
 .dinf { flex:1; min-width:0; }
 .dart-nm { font-size:.8em; color:var(--vscode-descriptionForeground); margin-bottom:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .dtitle { font-size:1em; font-weight:700; margin-bottom:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dyear  { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:4px; }
-.dmeta2 { font-size:.75em; color:var(--vscode-descriptionForeground); margin-bottom:5px; display:flex; flex-wrap:wrap; gap:4px 10px; }
-.dmeta2 span { white-space:nowrap; }
+.dyear  { font-size:.78em; color:var(--vscode-descriptionForeground); margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dmeta2 { font-size:.75em; color:var(--vscode-descriptionForeground); margin-bottom:5px; display:flex; flex-wrap:wrap; gap:4px 10px; overflow:hidden; }
+.dmeta2 span { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
 .dtags  { display:flex; flex-wrap:wrap; gap:4px; margin-bottom:7px; }
 .tag    { font-size:.68em; padding:2px 6px; border-radius:999px; background:rgba(255,255,255,.08); border:1px solid var(--vscode-widget-border,rgba(255,255,255,.1)); }
-.dtracks { font-size:.73em; color:var(--vscode-descriptionForeground); margin-bottom:7px; line-height:1.6; }
+.dtracks { font-size:.73em; color:var(--vscode-descriptionForeground); margin-bottom:7px; line-height:1.6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 /* ── album art lightbox ── */
 .dart { cursor:zoom-in; }
 .lightbox {
@@ -438,20 +529,16 @@ button:disabled { opacity:.35; cursor:not-allowed; }
   display:flex; align-items:center; justify-content:center;
 }
 .lb-close:hover { background:rgba(255,255,255,.25); }
-/* ── YouTube embed ── */
-.yt-wrap { margin-top:10px; }
+/* ── Discogs/YouTube links ── */
+.discogs-links { display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
 .yt-wrap.hidden { display:none; }
-.yt-btns { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap; }
-.yt-try { font-size:.74em; padding:3px 9px; }
-.yt-open { font-size:.74em; color:var(--vscode-textLink-foreground,#74b9ff); background:none; border:none; padding:0; cursor:pointer; text-decoration:underline; }
+.yt-open { font-size:.76em; color:var(--vscode-textLink-foreground,#74b9ff); background:none; border:none; padding:0; cursor:pointer; text-decoration:underline; }
 .yt-open:hover { filter:brightness(1.2); }
-.yt-frame-wrap { border-radius:5px; overflow:hidden; background:#000; }
-.yt-frame-wrap iframe { display:block; width:100%; height:200px; border:none; }
-/* ── Vibrant debug ── */
+
+/* ── Vibrant debug (inside Current Theme) ── */
 .dbg-wrap { margin-top:12px; padding-top:10px; border-top:1px solid var(--vscode-widget-border,rgba(255,255,255,.08)); }
 .dbg-wrap.hidden { display:none; }
 .dbg-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
-.dbg-url { font-size:.68em; color:var(--vscode-descriptionForeground); word-break:break-all; margin-bottom:8px; font-family:monospace; }
 .dbg-swatches { display:flex; flex-wrap:wrap; gap:6px; }
 .dbg-sw { display:flex; flex-direction:column; align-items:center; gap:3px; }
 .dbg-dot { width:24px; height:24px; border-radius:50%; border:2px solid rgba(255,255,255,.15); }
@@ -498,38 +585,17 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 <body>
 
 <div class="hdr">
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="28" height="28">
-    <path d="M64 6C29 6 6 29 6 58c0 14 6 26 16 34s24 14 38 14c10 0 18-4 22-12 2-5 0-12-4-16-3-3-3-8 0-10 3-2 8-1 11 2 5 5 13 4 19-2 14-14 14-50-18-58C82 7 73 6 64 6Z" fill="#6c5ce7"/>
-    <circle cx="38" cy="54" r="9" fill="#e17055"/><circle cx="55" cy="78" r="9" fill="#fdcb6e"/>
-    <circle cx="76" cy="82" r="9" fill="#00b894"/><circle cx="88" cy="50" r="9" fill="#74b9ff"/>
-    <circle cx="46" cy="38" r="9" fill="#fd79a8"/><circle cx="72" cy="28" r="8" fill="#a29bfe"/>
-    <ellipse cx="28" cy="78" rx="11" ry="13" fill="rgba(0,0,0,.3)"/>
-  </svg>
-  <h1>Discogs Theme Generator</h1>
-</div>
-<p class="sub">Generate themes from random colours or real Discogs album art.</p>
-
-<!-- Scope toggle -->
-<div class="scope-row">
-  <span class="scope-lbl">Apply to:</span>
-  <div class="seg" id="scope-seg">
-    <button class="seg-btn active" id="scope-ws" title="Apply theme only to this window">
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="14" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M1 5h14" stroke="currentColor" stroke-width="1"/></svg>
-      This window
-    </button>
-    <button class="seg-btn" id="scope-gl" title="Apply theme to all VS Code windows">
-      <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="6" y="7" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
-      All windows
-    </button>
+  <img class="hdr-icon" src="${iconUri}" alt="Discogs Theme Generator icon">
+  <div class="hdr-text">
+    <h1>Discogs Theme Generator</h1>
+    <span class="version">v${version} · <a href="#" id="credits-link" class="credits-link">created by martin barker</a></span>
   </div>
 </div>
+<p class="sub">Generate themes from real Discogs album art.</p>
 
-<!-- Actions -->
-<div class="actions">
-  <button class="bp" id="bg">
-    <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.5h6A1.5 1.5 0 0 1 12.5 5v6a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 11V5A1.5 1.5 0 0 1 5 3.5z"/></svg>
-    Generate Random
-  </button>
+<!-- Primary action -->
+<div class="primary-action">
+  <div class="hint">click to set color theme</div>
   <button class="bdiscogs" id="bd">
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
       <circle cx="12" cy="12" r="10"/>
@@ -537,9 +603,29 @@ button:disabled { opacity:.35; cursor:not-allowed; }
       <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/>
       <line x1="12" y1="7.5" x2="12" y2="2"/>
     </svg>
-    From Discogs
+    Randomly Refresh Discogs Theme
   </button>
-  <button class="bs" id="br" disabled>
+</div>
+
+<!-- Search row -->
+<div class="hint">or search for specific release:</div>
+<div class="search-row">
+  <input type="text" id="search-input" placeholder="Release ID or search (e.g. Pink Floyd Wish You Were Here)">
+  <button class="bp" id="search-btn">Search</button>
+</div>
+
+<!-- Scope toggle + Reset -->
+<div class="scope-lbl-row"><span class="lbl">Apply to</span></div>
+<div class="scope-row">
+  <button class="bs scope-btn active" id="scope-ws" title="Apply theme only to this window">
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="14" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M1 5h14" stroke="currentColor" stroke-width="1"/></svg>
+    This window
+  </button>
+  <button class="bs scope-btn" id="scope-gl" title="Apply theme to all VS Code windows">
+    <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><rect x="1" y="2" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><rect x="6" y="7" width="9" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+    All windows
+  </button>
+  <button class="bs" id="br" disabled style="margin-left:auto">
     <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path fill-rule="evenodd" d="M8 3a5 5 0 1 1-4.546 2.914.5.5 0 0 0-.908-.417A6 6 0 1 0 8 2v1z"/><path d="M8 4.466V.534a.25.25 0 0 0-.41-.192L5.23 2.308a.25.25 0 0 0 0 .384l2.36 1.966A.25.25 0 0 0 8 4.466z"/></svg>
     Reset
   </button>
@@ -547,24 +633,10 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
 <div class="sbar hidden" id="sb"><div class="spin"></div><span id="st"></span></div>
 
-<!-- Current theme -->
-<div class="sec">
-  <div class="sec-hd"><span class="lbl">Current Theme</span></div>
-  <div class="card">
-    <div class="swatches empty" id="sws">
-      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
-      <div class="sw"></div><div class="sw"></div><div class="sw"></div>
-    </div>
-    <div class="tname" id="tn">— No theme generated yet —</div>
-    <div class="tmeta" id="tm"></div>
-    <div class="erow hidden" id="er">
-      <button class="bsm" id="bcp">📋 Copy JSON</button>
-    </div>
-  </div>
-</div>
-
-<!-- Discogs release card -->
-<div class="sec" id="dsec">
+<!-- Discogs release + Current theme (side by side when space allows) -->
+<div class="theme-discogs-row">
+<!-- Discogs release card (hidden until release loaded) -->
+<div class="sec hidden" id="dsec">
   <div class="sec-hd"><span class="lbl">Discogs Release</span></div>
   <div class="dcrd hidden" id="dcrd">
     <div class="dcrd-top">
@@ -576,31 +648,37 @@ button:disabled { opacity:.35; cursor:not-allowed; }
         <div class="dmeta2"  id="dmeta2"></div>
         <div class="dtags"   id="dtgs"></div>
         <div class="dtracks" id="dtks"></div>
-        <button class="blink" id="dlnk">View on Discogs ↗</button>
+        <div class="discogs-links">
+          <button class="blink" id="dlnk">View on Discogs ↗</button>
+          <div class="yt-wrap hidden" id="yt-wrap">
+            <button class="yt-open" id="yt-ext">▶ Watch on YouTube ↗</button>
+          </div>
+        </div>
       </div>
     </div>
-    <!-- YouTube embed (two methods + external link) -->
-    <div class="yt-wrap hidden" id="yt-wrap">
-      <div class="yt-btns">
-        <button class="bsm yt-try" id="yt-toggle">Try youtube.com embed</button>
-        <button class="yt-open" id="yt-ext">▶ Open in YouTube ↗</button>
-      </div>
-      <div class="yt-frame-wrap">
-        <iframe id="yt-frame" allowfullscreen
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture">
-        </iframe>
-      </div>
+  </div>
+</div>
+
+<!-- Current theme -->
+<div class="sec">
+  <div class="sec-hd"><span class="lbl">Current Theme</span></div>
+  <div class="card">
+    <div class="tname" id="tn">— No theme generated yet —</div>
+    <div class="tmeta" id="tm"></div>
+    <div class="erow hidden" id="er">
+      <button class="bsm" id="bcp">📋 Copy JSON</button>
+      <button class="bsm hidden" id="btoggle">🌙 Dark Mode</button>
+      <button class="bsm hidden" id="breroll">🎲 Re-roll Colors</button>
     </div>
-    <!-- Vibrant debug info -->
     <div class="dbg-wrap hidden" id="dbg-wrap">
       <div class="dbg-hd">
         <span class="lbl" style="font-size:.62em">Vibrant Extraction</span>
         <button class="blink" style="font-size:.72em" id="dbg-hide">Hide</button>
       </div>
-      <div class="dbg-url" id="dbg-url"></div>
       <div class="dbg-swatches" id="dbg-swatches"></div>
     </div>
   </div>
+</div>
 </div>
 
 <!-- History -->
@@ -621,8 +699,10 @@ button:disabled { opacity:.35; cursor:not-allowed; }
       <button class="ar-btn" data-mode="onOpen">On workspace open</button>
       <button class="ar-btn" data-mode="interval">Every</button>
       <div class="ar-intv hidden" id="ar-intv">
-        <input type="number" id="ar-hours" min="1" max="168" value="2">
-        <span>hours</span>
+        <input type="number" id="ar-hours" min="0" max="168" value="2">
+        <span>h</span>
+        <input type="number" id="ar-mins" min="0" max="59" value="0">
+        <span>min</span>
       </div>
     </div>
     <div class="ar-hint" id="ar-hint"></div>
@@ -645,28 +725,38 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
   // ── refs ───────────────────────────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
-  const bg=$('bg'), bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr');
+  const bd=$('bd'), br=$('br'), bcp=$('bcp'), bclr=$('bclr'), btoggle=$('btoggle'), breroll=$('breroll');
   const sb=$('sb'), st=$('st');
-  const sws=$('sws'), tn=$('tn'), tm=$('tm'), er=$('er');
+  const tn=$('tn'), tm=$('tm'), er=$('er');
   const dcrd=$('dcrd'), dimg=$('dimg');
   const hlist=$('hlist');
   const scopeWs=$('scope-ws'), scopeGl=$('scope-gl');
-  const ytWrap=$('yt-wrap'), ytFrame=$('yt-frame');
-  const arHoursWrap=$('ar-intv'), arHoursInput=$('ar-hours'), arHint=$('ar-hint');
+  const ytWrap=$('yt-wrap');
+  const arHoursWrap=$('ar-intv'), arHoursInput=$('ar-hours'), arMinsInput=$('ar-mins'), arHint=$('ar-hint');
   const lightbox=$('lightbox'), lbImg=$('lb-img');
-  const dbgWrap=$('dbg-wrap'), dbgUrl=$('dbg-url'), dbgSwatches=$('dbg-swatches');
+  const dbgWrap=$('dbg-wrap'), dbgSwatches=$('dbg-swatches');
 
-  // current YouTube video ID and which domain is active
+  // current YouTube video ID
   let currentVideoId = null;
-  let ytUseNocookie  = true;
 
   // ── button handlers ────────────────────────────────────────────────────────
-  bg.onclick   = () => { hideStatus(); vsc.postMessage({ command:'generate' }); };
   bd.onclick   = () => vsc.postMessage({ command:'fromDiscogs' });
   br.onclick   = () => vsc.postMessage({ command:'reset' });
-  bcp.onclick  = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
-  bclr.onclick = () => vsc.postMessage({ command:'clearHistory' });
+
+  // ── search ─────────────────────────────────────────────────────────────────
+  function doSearch() {
+    const q = $('search-input').value.trim();
+    if (!q) { vsc.postMessage({ command:'fromDiscogs' }); return; }
+    vsc.postMessage({ command:'fromDiscogsSearch', query: q });
+  }
+  $('search-btn').onclick = doSearch;
+  $('search-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { doSearch(); } });
+  bcp.onclick     = () => { if (current) vsc.postMessage({ command:'copyJson', tokens:current.tokens, name:current.name }); };
+  btoggle.onclick = () => vsc.postMessage({ command:'toggleDarkLight' });
+  breroll.onclick = () => vsc.postMessage({ command:'rerollColors' });
+  bclr.onclick    = () => vsc.postMessage({ command:'clearHistory' });
   $('dlnk').onclick = () => { if (current?.discogs) vsc.postMessage({ command:'openUrl', url:current.discogs.uri }); };
+  $('credits-link').onclick = (e) => { e.preventDefault(); vsc.postMessage({ command:'openUrl', url:'https://www.martinbarker.me' }); };
 
   // ── lightbox ───────────────────────────────────────────────────────────────
   dimg.onclick = () => {
@@ -681,23 +771,16 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     }
   };
 
-  // ── YouTube toggle ─────────────────────────────────────────────────────────
-  $('yt-toggle').onclick = () => {
-    ytUseNocookie = !ytUseNocookie;
-    $('yt-toggle').textContent = ytUseNocookie ? 'Try youtube.com embed' : 'Try youtube-nocookie.com embed';
-    if (currentVideoId) { setYtSrc(currentVideoId); }
-  };
+  // ── YouTube link ───────────────────────────────────────────────────────────
   $('yt-ext').onclick = () => {
     if (currentVideoId) {
       vsc.postMessage({ command:'openUrl', url:\`https://www.youtube.com/watch?v=\${currentVideoId}\` });
+    } else if (current?.discogs) {
+      const q = encodeURIComponent(\`\${current.discogs.artists} \${current.discogs.title}\`);
+      vsc.postMessage({ command:'openUrl', url:\`https://www.youtube.com/results?search_query=\${q}\` });
     }
   };
   $('dbg-hide').onclick = () => { dbgWrap.classList.add('hidden'); };
-
-  function setYtSrc(videoId) {
-    const domain = ytUseNocookie ? 'www.youtube-nocookie.com' : 'www.youtube.com';
-    ytFrame.src = \`https://\${domain}/embed/\${videoId}?rel=0&modestbranding=1\`;
-  }
 
   // ── scope toggle ───────────────────────────────────────────────────────────
   scopeWs.onclick = () => setScopeUI(true);
@@ -716,30 +799,45 @@ button:disabled { opacity:.35; cursor:not-allowed; }
       document.querySelectorAll('.ar-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       arHoursWrap.classList.toggle('hidden', mode !== 'interval');
-      updateArHint(mode, +arHoursInput.value || 2);
+      updateArHint(mode, +arHoursInput.value || 0, +arMinsInput.value || 0);
       sendAutoRefresh(mode);
     });
   });
 
   arHoursInput.addEventListener('change', () => {
-    const hrs = Math.max(1, Math.min(168, +arHoursInput.value || 1));
+    const hrs = Math.max(0, Math.min(168, +arHoursInput.value || 0));
     arHoursInput.value = hrs;
     const mode = document.querySelector('.ar-btn.active')?.dataset?.mode || 'off';
-    updateArHint(mode, hrs);
+    updateArHint(mode, hrs, +arMinsInput.value || 0);
+    sendAutoRefresh(mode);
+  });
+
+  arMinsInput.addEventListener('change', () => {
+    const mins = Math.max(0, Math.min(59, +arMinsInput.value || 0));
+    arMinsInput.value = mins;
+    const mode = document.querySelector('.ar-btn.active')?.dataset?.mode || 'off';
+    updateArHint(mode, +arHoursInput.value || 0, mins);
     sendAutoRefresh(mode);
   });
 
   function sendAutoRefresh(mode) {
     vsc.postMessage({
       command: 'setAutoRefresh',
-      config: { mode, intervalHours: +arHoursInput.value || 2 },
+      config: { mode, intervalHours: +arHoursInput.value || 0, intervalMinutes: +arMinsInput.value || 0 },
     });
   }
 
-  function updateArHint(mode, hrs) {
-    if (mode === 'off')      { arHint.textContent = ''; }
-    else if (mode === 'onOpen')   { arHint.textContent = 'A new Discogs theme will load each time this workspace opens.'; }
-    else if (mode === 'interval') { arHint.textContent = \`A new Discogs theme will load every \${hrs} hour\${hrs===1?'':'s'}.\`; }
+  function updateArHint(mode, hrs, mins) {
+    if (mode === 'off')    { arHint.textContent = ''; return; }
+    if (mode === 'onOpen') { arHint.textContent = 'A new Discogs theme will load each time this workspace opens.'; return; }
+    if (mode === 'interval') {
+      const total = hrs * 60 + mins;
+      const parts = [];
+      if (hrs)  { parts.push(\`\${hrs}h\`); }
+      if (mins) { parts.push(\`\${mins}min\`); }
+      const label = parts.length ? parts.join(' ') : '5min';
+      arHint.textContent = \`A new Discogs theme will load every \${label}\${total < 5 ? ' (minimum 5 min)' : ''}.\`;
+    }
   }
 
   // ── extension messages ─────────────────────────────────────────────────────
@@ -792,8 +890,7 @@ button:disabled { opacity:.35; cursor:not-allowed; }
         break;
 
       case 'vibrantDebug': {
-        const { imageUrl, palette } = msg;
-        dbgUrl.textContent = 'Image URL: ' + imageUrl;
+        const { palette } = msg;
         dbgSwatches.innerHTML = '';
         const swatchOrder = [
           ['Vibrant',      palette.vibrant],
@@ -822,13 +919,14 @@ button:disabled { opacity:.35; cursor:not-allowed; }
         else { scopeGl.classList.add('active'); scopeWs.classList.remove('active'); }
         // Restore auto-refresh
         if (msg.autoRefresh) {
-          const { mode, intervalHours } = msg.autoRefresh;
+          const { mode, intervalHours, intervalMinutes } = msg.autoRefresh;
           document.querySelectorAll('.ar-btn').forEach(b => {
             b.classList.toggle('active', b.dataset.mode === mode);
           });
-          arHoursInput.value = intervalHours || 2;
+          arHoursInput.value = intervalHours ?? 2;
+          arMinsInput.value  = intervalMinutes ?? 0;
           arHoursWrap.classList.toggle('hidden', mode !== 'interval');
-          updateArHint(mode, intervalHours);
+          updateArHint(mode, intervalHours ?? 2, intervalMinutes ?? 0);
         }
         break;
     }
@@ -836,26 +934,30 @@ button:disabled { opacity:.35; cursor:not-allowed; }
 
   // ── current theme card ─────────────────────────────────────────────────────
   function renderCurrent(e) {
-    sws.classList.remove('empty');
-    sws.querySelectorAll('.sw').forEach((d,i) => { if (e.swatches[i]) d.style.background = e.swatches[i]; });
     const mc = e.isDark ? 'bd' : 'bl';
     const ml = e.isDark ? 'Dark' : 'Light';
     const sb2 = e.source==='discogs' ? ' <span class="badge bdisc">Discogs</span>' : '';
     tn.innerHTML = esc(e.name) + \` <span class="badge \${mc}">\${ml}</span>\` + sb2;
     tm.textContent = relT(e.timestamp);
     er.classList.remove('hidden');
+    const isDiscogs = e.source === 'discogs';
+    btoggle.classList.toggle('hidden', !isDiscogs);
+    breroll.classList.toggle('hidden', !isDiscogs);
+    if (isDiscogs) { btoggle.textContent = e.isDark ? '☀️ Light Mode' : '🌙 Dark Mode'; }
   }
 
   function clearCurrent() {
-    sws.classList.add('empty');
-    sws.querySelectorAll('.sw').forEach(s => s.style.background='');
     tn.textContent = '— No theme generated yet —';
     tm.textContent = '';
     er.classList.add('hidden');
+    btoggle.classList.add('hidden');
+    breroll.classList.add('hidden');
+    dbgWrap.classList.add('hidden');
   }
 
   // ── discogs card ────────────────────────────────────────────────────────────
   function renderDiscogsCard(rel, imgSrc) {
+    $('dsec').classList.remove('hidden');
     dcrd.classList.remove('hidden');
     dimg.src = imgSrc || '';
     $('dart').textContent  = rel.artists || '';
@@ -866,43 +968,36 @@ button:disabled { opacity:.35; cursor:not-allowed; }
     const meta2 = $('dmeta2');
     meta2.innerHTML = '';
     if (rel.format) {
-      const s = document.createElement('span');
-      s.textContent = '💿 ' + rel.format;
-      meta2.appendChild(s);
+      const s = document.createElement('span'); s.textContent = '💿 ' + rel.format; meta2.appendChild(s);
     }
     if (rel.label) {
-      const s = document.createElement('span');
-      s.textContent = '🏷 ' + rel.label;
-      meta2.appendChild(s);
+      const s = document.createElement('span'); s.textContent = '🏷 ' + rel.label; meta2.appendChild(s);
     }
 
     // Genre + Style tags
     const tgs = $('dtgs'); tgs.innerHTML = '';
     [...(rel.genres||[]), ...(rel.styles||[])].slice(0,8).forEach(t => {
-      const s=document.createElement('span'); s.className='tag'; s.textContent=t; tgs.appendChild(s);
+      const s = document.createElement('span'); s.className = 'tag'; s.textContent = t; tgs.appendChild(s);
     });
 
     const tkEl = $('dtks');
     tkEl.textContent = rel.tracklist?.length ? rel.tracklist.slice(0,6).join(' · ') : '';
 
-    // YouTube embed
-    if (rel.videoId) {
-      currentVideoId = rel.videoId;
-      ytUseNocookie  = true;
-      $('yt-toggle').textContent = 'Try youtube.com embed';
-      setYtSrc(rel.videoId);
-      ytWrap.classList.remove('hidden');
+    // YouTube link (smart)
+    currentVideoId = rel.videoId || null;
+    const ytBtn = $('yt-ext');
+    if (currentVideoId) {
+      ytBtn.textContent = '▶ Watch on YouTube ↗';
     } else {
-      currentVideoId = null;
-      ytWrap.classList.add('hidden');
-      ytFrame.src = '';
+      ytBtn.textContent = '🔍 Search on YouTube ↗';
     }
+    ytWrap.classList.remove('hidden');
   }
 
   function hideDiscogs() {
+    $('dsec').classList.add('hidden');
     dcrd.classList.add('hidden');
     ytWrap.classList.add('hidden');
-    ytFrame.src = '';
     currentVideoId = null;
     dbgWrap.classList.add('hidden');
   }
